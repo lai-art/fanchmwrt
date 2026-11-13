@@ -12,7 +12,7 @@ on:
         default: 'true'
 
 permissions:
-  contents: read
+  contents: write   # 失败日志外送需要写入 build-logs 分支
 
 env:
   # 目标设备配置文件名（configs/ 下）
@@ -43,17 +43,26 @@ jobs:
 
       - name: 安装编译依赖
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-            gettext git libncurses-dev libssl-dev python3 python3-distutils \
-            python3-setuptools python3-dev rsync subversion swig time \
-            unzip zlib1g-dev file wget curl ccache libelf-dev
+          set -e
+          sudo apt-get update
+          # 注意: Ubuntu 24.04 已移除 python3-distutils; gcc-multilib 仅 x86 有意义, 目标为 aarch64 不需要
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gettext git \
+            libncurses-dev libssl-dev libelf-dev liblzma-dev \
+            python3 python3-setuptools python3-dev \
+            rsync subversion swig time patch \
+            unzip zip bzip2 xz-utils zstd xsltproc \
+            zlib1g-dev file wget curl ccache cmake
+          echo "=== 工具自检 ==="
+          for t in gcc g++ make python3 rsync unzip patch ccache cmake; do
+            printf '%-10s ' "$t"
+            command -v "$t" >/dev/null && "$t" --version 2>&1 | head -1 || echo "缺失!"
+          done
 
       - name: 准备 ccache
         uses: actions/cache@v4
         with:
-          path: ~/.ccache
+          path: ${{ github.workspace }}/.ccache
           key: ccache-${{ github.ref_name }}-${{ github.sha }}
           restore-keys: |
             ccache-${{ github.ref_name }}-
@@ -61,13 +70,14 @@ jobs:
 
       - name: 配置 ccache
         run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.ccache"
           ccache --max-size=2G
           ccache --set-config=compression=true
           ccache --zero-stats || true
 
-      - name: 更新 feeds（GitHub 镜像加速）
+      - name: 更新 feeds（GitHub 镜像）
         run: |
-          # feeds.conf.default 已指向 GitHub 官方镜像（commit 与 git.openwrt.org 一致）
+          # feeds.conf.default 使用 GitHub 官方镜像 + 与上游一致的 commit 固定
           ./scripts/feeds update -a
 
       - name: 应用 feeds_patches（构建期文件覆盖）
@@ -105,28 +115,69 @@ jobs:
           cp "configs/${DEVICE_CONFIG}" .config
           # 补全依赖（只新增依赖项，不覆盖显式选择）
           make defconfig
-          echo "=== 关键选型确认 ==="
-          grep -E "CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-256mb-v1=y|CONFIG_PACKAGE_kmod-mt_wifi=y|CONFIG_MTK_FIRST_IF_MT7981=y|CONFIG_PACKAGE_luci-compat=y|CONFIG_PACKAGE_luci-theme-argon=y|CONFIG_PACKAGE_luci-theme-aurora=y|CONFIG_PACKAGE_luci-app-Airpifanctrl=y|CONFIG_PACKAGE_luci-app-mwrt-catcage=y" .config || true
-          echo "=== 确认开源 mt76 未启用 ==="
-          grep -E "CONFIG_PACKAGE_kmod-mt7915e=y|CONFIG_PACKAGE_kmod-mt76-core=y" .config && echo "::warning::检测到开源 mt76 仍被启用" || echo "OK: 开源 mt76 未启用"
+
+      - name: 配置自检
+        run: |
+          echo "=== 关键选型硬校验 ==="
+          fail=0
+          for c in \
+            CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-256mb-v1 \
+            CONFIG_PACKAGE_kmod-mt_wifi \
+            CONFIG_MTK_FIRST_IF_MT7981 \
+            CONFIG_PACKAGE_luci-compat \
+            CONFIG_PACKAGE_luci-theme-argon \
+            CONFIG_PACKAGE_luci-theme-aurora \
+            CONFIG_PACKAGE_luci-app-mwrt-catcage \
+            CONFIG_PACKAGE_luci-app-Airpifanctrl ; do
+            if grep -qx "${c}=y" .config; then
+              echo "  OK   $c"
+            else
+              echo "::error::关键选型缺失: $c"
+              fail=1
+            fi
+          done
+          echo
+          echo "=== 开源 mt76 关闭确认 ==="
+          if grep -qE "^CONFIG_PACKAGE_kmod-(mt76|mt7915e|mt7981-firmware)=y" .config; then
+            grep -E "^CONFIG_PACKAGE_kmod-(mt76|mt7915e|mt7981-firmware)=y" .config
+            echo "::error::开源 mt76 仍被启用"
+            fail=1
+          else
+            echo "  OK: 无开源 mt76 相关包"
+          fi
+          echo
+          echo "=== 配置中请求但被丢弃的包（检查是否漏编） ==="
+          drop=0
+          for p in $(grep -oE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' "configs/${DEVICE_CONFIG}" | sed -E 's/^CONFIG_PACKAGE_//; s/=y$//'); do
+            if ! grep -qx "CONFIG_PACKAGE_${p}=y" .config; then
+              echo "  丢弃: $p"
+              drop=$((drop + 1))
+            fi
+          done
+          echo "共丢弃 ${drop} 项"
+          [ "$fail" -eq 0 ] || exit 1
 
       - name: 下载依赖包
         run: |
           make download -j8 || make download -j1 V=s
-          find dl -size -1024c -exec ls -l {} \; || true
+          echo "=== 怀疑下载不完整的文件 (<1KB) ==="
+          find dl -size -1024c -exec ls -l {} \; 2>/dev/null || true
 
       - name: 编译固件
+        id: build
         run: |
+          set -o pipefail
           echo "并行任务数: $(nproc)"
-          make -j$(nproc) || make -j1 V=s
+          make -j"$(nproc)" 2>&1 | tee /tmp/make.log
         env:
-          CCACHE_DIR: ~/.ccache
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
 
       - name: ccache 统计
         if: always()
         run: ccache --show-stats || true
 
       - name: 收集产物
+        if: success()
         run: |
           mkdir -p artifacts
           if [ -d "${OUTPUT_DIR}" ]; then
@@ -139,7 +190,7 @@ jobs:
           ls -lh artifacts/ || true
 
       - name: 上传固件
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: fanchmwrt-tr3000-256m-${{ github.run_number }}
@@ -147,9 +198,32 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: 构建日志（失败时）
+      # 失败时把日志推到 build-logs 分支，便于外部直接读取（Actions 日志端点需管理员权限）
+      - name: 失败日志外送
         if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== 编译失败，收集诊断信息 ==="
-          find . -name "*.log" -path "*build_dir*" -newer .config 2>/dev/null | head -20 || true
-          ls -la logs/ 2>/dev/null || true
+          set +e
+          D=/tmp/diag
+          rm -rf "$D"; mkdir -p "$D/pkglogs"
+          [ -f /tmp/make.log ] && { cp -f /tmp/make.log "$D/make.log"; tail -n 800 /tmp/make.log > "$D/make_tail.log"; }
+          [ -f /tmp/make.log ] && grep -nE "error:|Error [0-9]+:|undefined reference|No rule to make target|collect2: error|fatal error|\*\*\* \[" /tmp/make.log > "$D/errors.txt"
+          [ -f .config ] && cp -f .config "$D/dotconfig.txt"
+          # OpenWrt 每包编译日志，只挑含错误的
+          if [ -d logs ]; then
+            find logs -type f -name "*.txt" 2>/dev/null | while IFS= read -r f; do
+              if grep -qE "error:|Error [0-9]+:" "$f" 2>/dev/null; then
+                cp -f "$f" "$D/pkglogs/$(printf '%s' "$f" | tr '/' '_')"
+              fi
+            done
+          fi
+          echo "收集到文件:"; ls -lR "$D" | head -60
+
+          cd "$D" || exit 0
+          git init -q .
+          git config user.email "ci@fanchmwrt.local"
+          git config user.name "fanchmwrt-ci"
+          git add -A
+          git commit -qm "build #${{ github.run_number }} failure logs (run ${{ github.run_id }})" || exit 0
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/build-logs
