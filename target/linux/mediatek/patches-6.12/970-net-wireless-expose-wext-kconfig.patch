@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# 让 MTK 闭源无线驱动 (mt_wifi) 依赖的 WEXT 符号能在 target config 里直接选中
+#
+# mt_wifi 是纯 WEXT 驱动, ioctl 层直接使用 struct net_device 的
+# wireless_handlers / wireless_data 成员, 这两个成员由 CONFIG_WIRELESS_EXT
+# 控制 (include/linux/netdevice.h: "#ifdef CONFIG_WIRELESS_EXT")。
+#
+# 但 mainline 的 net/wireless/Kconfig 里 WIRELESS_EXT 是**没有 prompt 的
+# bool**, 只能被老式无线驱动 select, 无法在 target config 里写 =y;
+# 而 OpenWrt 官方 target 一律走 cfg80211 (mt76), 既不需要也不会去开它。
+# 结果是: 即便 target config 写了 CONFIG_WIRELESS_EXT=y, 经过
+# make oldconfig 也会被 kconfig 重算回 n, 成员随之消失, 编译必失败。
+#
+# 厂家 6.6 基线正是用 target/linux/mediatek/patches-6.6/
+# 010-01-add-mtk-wifi-utility-rbus.patch 给这些符号补 prompt 解决的。
+# 此处把该 patch 的 Kconfig 部分移植到 6.12 (两版 Kconfig 结构完全一致),
+# 只保留 WEXT_* 与 LIB80211_* 相关项, 不取其中与 rbus 硬件相关的部分。
+#
+# WEXT_CORE 本来就是 def_bool y, 只要 WIRELESS_EXT 可见即可带出;
+# WEXT_SPY / WEXT_PRIV 与 LIB80211_* 一并加 prompt, 是为了与厂家基线保持一致,
+# 也便于后续在 config 中按需开关 (依赖它们的驱动会 select)。
+# ---------------------------------------------------------------------------
+--- a/net/wireless/Kconfig
++++ b/net/wireless/Kconfig
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ config WIRELESS_EXT
+-	bool
++	bool "Wireless extensions"
+ 
+ config WEXT_CORE
+ 	def_bool y
+@@ -12,10 +12,10 @@
+ 	depends on WEXT_CORE
+ 
+ config WEXT_SPY
+-	bool
++	bool "WEXT_SPY"
+ 
+ config WEXT_PRIV
+-	bool
++	bool "WEXT_PRIV"
+ 
+ config CFG80211
+ 	tristate "cfg80211 - wireless configuration API"
+@@ -214,7 +214,7 @@
+ endif # CFG80211
+ 
+ config LIB80211
+-	tristate
++	tristate "LIB80211"
+ 	default n
+ 	help
+ 	  This options enables a library of common routines used
+@@ -223,17 +223,17 @@
+ 	  Drivers should select this themselves if needed.
+ 
+ config LIB80211_CRYPT_WEP
+-	tristate
++	tristate "LIB80211_CRYPT_WEP"
+ 	select CRYPTO_LIB_ARC4
+ 
+ config LIB80211_CRYPT_CCMP
+-	tristate
++	tristate "LIB80211_CRYPT_CCMP"
+ 	select CRYPTO
+ 	select CRYPTO_AES
+ 	select CRYPTO_CCM
+ 
+ config LIB80211_CRYPT_TKIP
+-	tristate
++	tristate "LIB80211_CRYPT_TKIP"
+ 	select CRYPTO_LIB_ARC4
+ 
+ config LIB80211_DEBUG

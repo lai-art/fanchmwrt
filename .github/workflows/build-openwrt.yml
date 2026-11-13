@@ -249,44 +249,40 @@ jobs:
           echo "=== 怀疑下载不完整的文件 (<1KB) ==="
           find dl -size -1024c -exec ls -l {} \; 2>/dev/null || true
 
-      - name: 内核配置预检
+      - name: 内核补丁预检
         run: |
           set +e
-          echo "=== 生成内核配置 (prepare + configure) ==="
-          make target/linux/configure V=s 2>&1 | tail -80
-          echo "target/linux/configure 退出码: $?"
-          KC=$(ls -t build_dir/target-*/linux-filogic/linux-*/.config 2>/dev/null | head -1)
-          echo "内核 .config: ${KC:-<未生成>}"
-          if [ -z "$KC" ]; then
-            echo "!! 内核 .config 未生成, prepare/configure 阶段已失败"
+          # 注意: OpenWrt 没有 target/linux/configure 这个目标 (只有
+          # prepare / compile / install), 之前误用它会直接 "No rule to make target"。
+          # 这里只做两件快事:
+          #   1) 编 tools —— target/linux/prepare 依赖 $(STAGING_DIR_HOST)/bin/patch,
+          #      那是 tools/patch 的产物, 单跑 target 目标不会自动带上。
+          #   2) 跑 prepare —— 解压内核 + 按序应用 generic/pending -> hack
+          #      -> target/patches, 我们新加的 970 补丁能否干净应用, 这一步就能判定。
+          # prepare 成功后 world 会复用 stamp, 不重复劳动。
+          make tools/compile V=s > /tmp/prep_tools.log 2>&1
+          echo "tools/compile rc=$?"
+          make target/linux/prepare V=s > /tmp/kernel_prep.log 2>&1
+          rc=$?
+          echo "target/linux/prepare rc=$rc"
+          echo "=== 预检日志尾部 ==="
+          tail -45 /tmp/kernel_prep.log
+          if [ $rc -ne 0 ]; then
+            echo "!! 内核准备阶段失败 (补丁应用或解压出错), 见 kernel_prep_tail.txt"
             exit 1
           fi
-          fail=0
-          echo "=== WEXT 必须项 (mt_wifi 的 ioctl 层建在 net_device 上) ==="
-          for s in CONFIG_WIRELESS CONFIG_WIRELESS_EXT CONFIG_WEXT_CORE CONFIG_WEXT_PROC CONFIG_WEXT_SPY CONFIG_WEXT_PRIV; do
-            v=$(grep -m1 -E "^# ${s} is not set|^${s}=" "$KC")
-            if [ "$v" = "$s=y" ]; then
-              echo "  OK   $v"
+          echo "=== 970 补丁是否已应用到内核源码 ==="
+          KC=$(find build_dir -maxdepth 4 -type f -path "*linux-filogic*/linux-*/net/wireless/Kconfig" 2>/dev/null | head -1)
+          echo "内核 Kconfig: ${KC:-<未找到>}"
+          if [ -n "$KC" ]; then
+            grep -A2 -m1 "^config WIRELESS_EXT" "$KC" | sed 's/^/  /'
+            if grep -A1 -m1 "^config WIRELESS_EXT" "$KC" | grep -q 'bool "Wireless extensions"'; then
+              echo "  OK  WIRELESS_EXT 已带 prompt, 可在 target config 中选中"
             else
-              echo "  FAIL ${s}  实际: ${v:-<符号不存在>}  <-- wireless_handlers 成员会缺失, mt_wifi 必编译失败"
-              fail=1
+              echo "  FAIL WIRELESS_EXT 仍是裸 bool, 970 补丁未生效"
+              exit 1
             fi
-          done
-          echo "=== cfg80211 必须由 mac80211 backports 提供, 内核侧不内建 ==="
-          for s in CONFIG_CFG80211 CONFIG_CFG80211_WEXT; do
-            v=$(grep -m1 -E "^# ${s} is not set|^${s}=" "$KC")
-            case "$v" in
-              "$s=y"|"$s=m") echo "  FAIL $v  内核内建会与 backports 包冲突"; fail=1 ;;
-              *) echo "  OK   ${v:-$s 未设置}" ;;
-            esac
-          done
-          {
-            echo "kernel_config=$KC"
-            grep -E "^# (CONFIG_WIRELESS|CONFIG_WEXT|CONFIG_CFG80211)|^(CONFIG_WIRELESS|CONFIG_WEXT|CONFIG_CFG80211)" "$KC"
-            echo "fail=$fail"
-          } > /tmp/kernel_check.txt
-          echo "=== 预检结果: fail=$fail ==="
-          exit $fail
+          fi
 
       - name: 编译固件
         id: build
@@ -361,7 +357,8 @@ jobs:
             ls -l /tmp/make.log | awk '{print "make.log 原始大小: "$5" 字节"}'
           fi
           [ -f /tmp/config_check.txt ] && cp -f /tmp/config_check.txt "$D/config_check.txt"
-          [ -f /tmp/kernel_check.txt ] && cp -f /tmp/kernel_check.txt "$D/kernel_check.txt"
+          [ -f /tmp/kernel_prep.log ] && tail -n 2500 /tmp/kernel_prep.log > "$D/kernel_prep_tail.txt"
+          [ -f /tmp/prep_tools.log ] && tail -n 400 /tmp/prep_tools.log > "$D/prep_tools_tail.txt"
           [ -f .config ] && cp -f .config "$D/dotconfig.txt"
 
           # 环境快照: 内核并行编译极易 OOM, 也常因磁盘满静默失败
