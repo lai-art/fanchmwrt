@@ -281,13 +281,23 @@ static int mt_pci_dev_set(struct pci_dev *pdev, unsigned long *csr_addr)
 	}
 	else
 #endif
-	if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(32))) {
+#if (KERNEL_VERSION(6, 7, 0) <= LINUX_VERSION_CODE)
+	/* Linux 6.7 删除了 pci_set_dma_mask() / pci_set_consistent_dma_mask(),
+	 * 等价替代是 dma_set_mask_and_coherent(): 一次同时设置 dma mask 与
+	 * coherent mask, 语义与原来的两次调用完全一致。
+	 */
+	rv = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+#else
+	rv = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+	if (rv == 0) {
 		/*
 		 * pci_set_consistent_dma_mask() will always be able to set the same
 		 * or a smaller mask as pci_set_dma_mask()
 		 */
 		pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32));
-	} else {
+	}
+#endif
+	if (rv != 0) {
 		MTWF_DBG(NULL, DBG_CAT_HIF, CATHIF_PCI, DBG_LVL_ERROR,
 				 "set DMA mask failed!errno=%d\n", rv);
 		goto err_out;

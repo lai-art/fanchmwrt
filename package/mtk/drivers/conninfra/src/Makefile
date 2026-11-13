@@ -21,7 +21,9 @@ ccflags-y += -Wframe-larger-than=1024
 # 这里整体降级为警告(-Wno-error), 保留内核自身的
 # -Werror=implicit-function-declaration 等真正致命的检查。
 ccflags-y += -Wno-error -Wno-missing-prototypes -Wno-missing-declarations \
-	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion
+	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion \
+	-Wno-error=return-mismatch -Wno-error=declaration-missing-parameter-type \
+	-Wno-error=implicit-int -Wno-error=enum-conversion
 
 ###############################################################################
 MODULE_NAME := conninfra

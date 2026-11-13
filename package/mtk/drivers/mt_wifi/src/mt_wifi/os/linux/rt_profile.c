@@ -1411,7 +1411,7 @@ void announce_802_11_radiotap_packet(RTMP_ADAPTER *pAd, PNDIS_PACKET pPacket, st
 	if (pOSPkt->dev == NULL)
 		RELEASE_NDIS_PACKET(pAd, pPacket, NDIS_STATUS_FAILURE);
 	else
-		netif_rx_ni(pOSPkt);
+		netif_rx(pOSPkt);
 
 }
 #endif

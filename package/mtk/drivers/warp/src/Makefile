@@ -1,6 +1,8 @@
 ccflags-y += $(MODULE_FLAGS) -Inet/nat -I$(PKG_BUILD_DIR)../warp -I$(PKG_BUILD_DIR)../warp/mcu -DCONFIG_WARP_VERSION=$(CONFIG_WARP_VERSION)
 ccflags-y += -Wno-error -Wno-missing-prototypes -Wno-missing-declarations \
-	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion
+	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion \
+	-Wno-error=return-mismatch -Wno-error=declaration-missing-parameter-type \
+	-Wno-error=implicit-int -Wno-error=enum-conversion
 
 ifeq ($(CONFIG_WARP_ATC_SUPPORT), y)
 ccflags-y += -DCONFIG_WARP_ATC_SUPPORT

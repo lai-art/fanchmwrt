@@ -575,7 +575,7 @@ void send_radiotap_mt7615_monitor_packets(
 	memcpy((pOSPkt->data + mtk_rt_hdr->rt_hdr.it_len - MT7615_RMAC_LENGTH), rmac_info_buffer, MT7615_RMAC_LENGTH);
 #endif
 #endif
-	netif_rx_ni(pOSPkt);
+	netif_rx(pOSPkt);
 #ifdef SNIFFER_MT7615_RMAC_INC
 	os_free_mem(rmac_info_buffer);
 #endif
@@ -1127,7 +1127,7 @@ void send_radiotap_monitor_packets(
 	pOSPkt->pkt_type = PACKET_OTHERHOST;
 	pOSPkt->protocol = __constant_htons(ETH_P_80211_RAW);
 	pOSPkt->ip_summed = CHECKSUM_NONE;
-	netif_rx_ni(pOSPkt);
+	netif_rx(pOSPkt);
 	return;
 err_free_sk_buff:
 	RELEASE_NDIS_PACKET(NULL, pRxPacket, NDIS_STATUS_FAILURE);

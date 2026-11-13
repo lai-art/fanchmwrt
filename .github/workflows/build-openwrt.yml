@@ -14,6 +14,12 @@ on:
 permissions:
   contents: write   # 失败日志外送需要写入 build-logs 分支
 
+# 同一分支只保留最新一次构建: 新推送直接取消在跑的那次。
+# 否则多个 run 并发写 build-logs 分支, 日志会互相覆盖, 排查时无法确定日志属于哪个 commit。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # 目标设备配置文件名（configs/ 下）
   DEVICE_CONFIG: cudy_tr3000-256mb-v1.config
@@ -317,7 +323,9 @@ jobs:
             echo "=== 重编 $pkg (V=s) ==="
             # 先清掉该包的构建目录, 否则 make 会认为已完成
             timeout 300 make "$pkg/clean" V=s >/dev/null 2>&1
-            timeout 900 make "$pkg/compile" V=s -j1 > "$D/pkglogs/rebuild_${safe}.log" 2>&1
+            # -k: make 遇错继续, 一次把该包所有编译错误都抓出来,
+            # 避免每轮构建只能暴露一个错误、一轮一小时地往前挪。
+            timeout 1200 make "$pkg/compile" V=s -j1 -k > "$D/pkglogs/rebuild_${safe}.log" 2>&1
             echo "  -> 日志 $(wc -c < "$D/pkglogs/rebuild_${safe}.log") 字节"
             # 同时保留 OpenWrt 自己写的编译日志
             for f in $(find logs -type f -path "*${pkg#package/}*" -name "*.txt" 2>/dev/null); do

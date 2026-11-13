@@ -6159,7 +6159,14 @@ static NDIS_STATUS pci_init_task_group(void *hdev_ctrl)
 			hif_chip->schedule_task_ops = &tasklet_napi_schedule_ops;
 			init_dummy_netdev(&task_group->napi_dev);
 			task_group->priv = (VOID *)hif_chip;
+#if (KERNEL_VERSION(6, 1, 0) <= LINUX_VERSION_CODE)
+			/* Linux 6.1 起 netif_napi_add() 去掉 weight 参数, 固定用 NAPI_POLL_WEIGHT;
+			 * 需要显式指定 weight 时改调 netif_napi_add_weight()。
+			 */
+			netif_napi_add_weight(&task_group->napi_dev, &task_group->rx_data_done_napi_task, pci_rx_data_done_poll_func, NAPI_POLL_WEIGHT);
+#else
 			netif_napi_add(&task_group->napi_dev, &task_group->rx_data_done_napi_task, pci_rx_data_done_poll_func, NAPI_POLL_WEIGHT);
+#endif
 			ad->tr_ctl.napi = (VOID *)&task_group->rx_data_done_napi_task;
 			napi_enable(&task_group->rx_data_done_napi_task);
 			RTMP_OS_TASKLET_INIT(NULL, &task_group->rx_event_done_task, pci_rx_event_done_func, (unsigned long)hif_chip);
