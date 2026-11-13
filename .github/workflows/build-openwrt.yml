@@ -59,6 +59,9 @@ jobs:
             rsync subversion swig time patch \
             unzip zip bzip2 xz-utils zstd xsltproc \
             zlib1g-dev file wget curl ccache cmake
+          # gcc-14 只用于「编译标志预检」: 交叉工具链是 GCC 14.3, 宿主机默认
+          # 却是 13.x, 用 13 校验 -Wno-error=return-mismatch 会误判。装不上就算了。
+          sudo apt-get install -y --no-install-recommends gcc-14 || true
           echo "=== 工具自检 ==="
           for t in gcc g++ make python3 rsync unzip patch ccache cmake; do
             printf '%-10s ' "$t"
@@ -243,6 +246,48 @@ jobs:
           log "=== 自检结果: fail=${fail} ==="
           [ "$fail" -eq 0 ]
 
+      # GCC 对未知的 -Wno-error=NAME 是硬错误, 不是警告:
+      #   error: '-Wno-error=macro-redefined': no option '-Wmacro-redefined'
+      # 一个拼错的标志会让整个包连一个 .c 都不编译就失败, 而发现它要等 40 分钟。
+      # 宿主机 gcc 逐个试一遍, 秒级自爆。
+      - name: 编译标志预检
+        run: |
+          set +e
+          : > /tmp/flag_check.txt
+          # 宿主机默认 gcc 是 13.x, 而 OpenWrt 25.12 的交叉 gcc 是 14.3。
+          # return-mismatch / declaration-missing-parameter-type 都是 GCC 14 新增
+          # 的警告名(此前无名或含在 -Wreturn-type 里), 用 13 校验会误判成非法,
+          # 所以优先用 gcc-14, 实在没有就对这两个名字跳过校验。
+          CCBIN=$(command -v gcc-14 || command -v gcc)
+          MAJOR=$($CCBIN -dumpversion 2>/dev/null | cut -d. -f1)
+          echo "校验用编译器: $CCBIN (版本 ${MAJOR:-?})"
+          bad=0
+          for f in $(find package/mtk target/linux/mediatek -name 'Makefile*' -type f 2>/dev/null); do
+            for w in $(grep -oE '\-W(no-)?error=[A-Za-z0-9_-]+' "$f" \
+                       | sed -E 's/^-W(no-)?error=//' | sort -u); do
+              case "$w" in
+                return-mismatch|declaration-missing-parameter-type)
+                  if [ "${MAJOR:-0}" -lt 14 ]; then
+                    echo "SKIP $f : -Wno-error=$w (GCC14 新增项, 当前校验器不认识, 无法判定)" \
+                      | tee -a /tmp/flag_check.txt
+                    continue
+                  fi ;;
+              esac
+              echo 'int main(void){return 0;}' > /tmp/t.c
+              if ! $CCBIN "-Wno-error=$w" -c /tmp/t.c -o /tmp/t.o 2>/tmp/t.err; then
+                { echo "FAIL $f : -Wno-error=$w"
+                  sed -n '1,2p' /tmp/t.err; } | tee -a /tmp/flag_check.txt
+                bad=$((bad + 1))
+              fi
+            done
+          done
+          if [ "$bad" -eq 0 ]; then
+            echo "=== 编译标志全部合法 ==="
+          else
+            echo "::error::发现 $bad 个非法编译标志 (见 flag_check.txt)"
+          fi
+          [ "$bad" -eq 0 ]
+
       - name: 下载依赖包
         run: |
           make download -j8 || make download -j1 V=s
@@ -357,6 +402,7 @@ jobs:
             ls -l /tmp/make.log | awk '{print "make.log 原始大小: "$5" 字节"}'
           fi
           [ -f /tmp/config_check.txt ] && cp -f /tmp/config_check.txt "$D/config_check.txt"
+          [ -f /tmp/flag_check.txt ] && cp -f /tmp/flag_check.txt "$D/flag_check.txt"
           [ -f /tmp/kernel_prep.log ] && tail -n 2500 /tmp/kernel_prep.log > "$D/kernel_prep_tail.txt"
           [ -f /tmp/prep_tools.log ] && tail -n 400 /tmp/prep_tools.log > "$D/prep_tools_tail.txt"
           [ -f .config ] && cp -f .config "$D/dotconfig.txt"

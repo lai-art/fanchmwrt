@@ -24,7 +24,7 @@ ccflags-y += -Wno-error -Wno-missing-prototypes -Wno-missing-declarations \
 	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion \
 	-Wno-error=return-mismatch -Wno-error=declaration-missing-parameter-type \
 	-Wno-error=implicit-int -Wno-error=enum-conversion \
-	-Wno-error=implicit-function-declaration -Wno-error=macro-redefined
+	-Wno-error=implicit-function-declaration
 
 ###############################################################################
 MODULE_NAME := conninfra

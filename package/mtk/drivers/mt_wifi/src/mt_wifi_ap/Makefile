@@ -2040,7 +2040,7 @@ ccflags-y += -Wno-error -Wno-missing-prototypes -Wno-missing-declarations \
 	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion \
 	-Wno-error=return-mismatch -Wno-error=declaration-missing-parameter-type \
 	-Wno-error=implicit-int -Wno-error=enum-conversion \
-	-Wno-error=implicit-function-declaration -Wno-error=macro-redefined
+	-Wno-error=implicit-function-declaration
 #WFLAGS += -DCONFIG_CSO_SUPPORT
 #WFLAGS += -DMSP_UTILITY
 EXTRA_CFLAGS += -DTX_POWER_CONTROL_SUPPORT
