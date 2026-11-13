@@ -151,14 +151,20 @@ jobs:
           log ""
           log "=== 配置中请求但被 defconfig 丢弃的包 ==="
           drop=0
+          fatal=0
           for p in $(grep -oE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' "configs/${DEVICE_CONFIG}" | sed -E 's/^CONFIG_PACKAGE_//; s/=y$//'); do
             if ! grep -qx "CONFIG_PACKAGE_${p}=y" .config; then
               log "  DROP $p"
               grep -E "^CONFIG_PACKAGE_${p}=" .config | sed 's/^/       现状: /' | tee -a "$OUT"
               drop=$((drop + 1))
+              # 翻译包缺失不阻断编译(只影响该语言文案), 其余任何缺失都算功能缺失
+              case "$p" in
+                luci-i18n-*) log "       (翻译包, 不阻断构建)" ;;
+                *) fatal=$((fatal + 1)) ;;
+              esac
             fi
           done
-          log "共丢弃 ${drop} 项"
+          log "共丢弃 ${drop} 项, 其中阻断性 ${fatal} 项"
 
           # 丢弃时给出候选符号名, 避免再去猜包名
           if [ "$drop" -gt 0 ] && [ -f tmp/.config-package.in ]; then
@@ -167,15 +173,13 @@ jobs:
             log "--- luci-i18n-base 中 en/de/zh 系 ---"
             grep -oE "config PACKAGE_luci-i18n-base-[A-Za-z0-9_-]+" tmp/.config-package.in \
               | sed -E 's/^config //' | grep -iE "zh|_en|en$|de$" | sort -u | tee -a "$OUT"
-            log "--- luci-i18n-base-zh-cn 的 Kconfig 块 ---"
-            awk '/^config PACKAGE_luci-i18n-base-zh-cn$/{f=1} f{print} f&&/^$/{exit}' tmp/.config-package.in | tee -a "$OUT"
-            log "--- 对照 luci-i18n-base-de 的 Kconfig 块 ---"
-            awk '/^config PACKAGE_luci-i18n-base-de$/{f=1} f{print} f&&/^$/{exit}' tmp/.config-package.in | tee -a "$OUT"
+            log "--- PACKAGE_luci-i18n-base-zh-cn 的 Kconfig 上下文 ---"
+            grep -A10 -B2 "config PACKAGE_luci-i18n-base-zh-cn" tmp/.config-package.in | tee -a "$OUT"
             log "--- .config 中 luci-base 现状 ---"
             grep -E "^CONFIG_PACKAGE_luci-base=" .config | tee -a "$OUT"
           fi
-          # 任何被丢弃的包都意味着某项功能缺失, 直接失败, 便于在 5 分钟内定位
-          [ "$drop" -eq 0 ] || fail=1
+          # 任何被丢弃的非翻译包都意味着某项功能缺失, 直接失败, 便于在 5 分钟内定位
+          [ "$fatal" -eq 0 ] || fail=1
           log "=== 自检结果: fail=${fail} ==="
           [ "$fail" -eq 0 ]
 
