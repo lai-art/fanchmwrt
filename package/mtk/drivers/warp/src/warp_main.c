@@ -17,6 +17,7 @@
 /*Main module of WHNAT, use to for register hook function and probe for wifi chip*/
 
 #include <linux/init.h>
+#include <linux/version.h>
 #include <linux/module.h>
 
 #include "warp.h"
@@ -504,6 +505,25 @@ warp_remove(struct platform_device *pdev)
 
 	return 0;
 }
+
+/*
+ * Linux 6.11 起 platform_driver.remove 的返回类型由 int 改为 void
+ * (commit 0edb555a65d1 "platform: Make platform_driver.remove() return void")。
+ * 本文件在 6.12 上编译时会得到:
+ *   error: assignment to 'void (*)(struct platform_device *)' from
+ *          incompatible pointer type 'int (*)(struct platform_device *)'
+ * 该错误由 GCC 14 默认抛出(不受 -Werror 影响), 因此按版本做适配。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+static void
+warp_remove_void(struct platform_device *pdev)
+{
+	(void)warp_remove(pdev);
+}
+#define WARP_PDRV_REMOVE_FN warp_remove_void
+#else
+#define WARP_PDRV_REMOVE_FN warp_remove
+#endif
 
 /*
 *
@@ -1028,7 +1048,7 @@ warp_register_client(struct wifi_hw *hw, struct wifi_ops *ops)
 
 	pdriver = &warp->pdriver;
 	pdriver->probe = warp_probe;
-	pdriver->remove = warp_remove;
+	pdriver->remove = WARP_PDRV_REMOVE_FN;
 	pdriver->driver.name = name;
 	pdriver->driver.owner = THIS_MODULE;
 	pdriver->driver.of_match_table = warp_of_ids;
@@ -1239,7 +1259,7 @@ warp_isr_handler(void *priv_data)
 
 	wed = &warp->wed;
 	struct wifi_entry *wifi = &warp->wifi;
-	struct wifi_hw *hw = &wifi->hw;
+	struct wifi_hw *hw __maybe_unused = &wifi->hw;
 
 	warp_eint_ctrl_hw(wed, false);
 	warp_eint_get_stat_hw(wed, &status);

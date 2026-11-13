@@ -140,6 +140,15 @@ jobs:
             fi
           done
           log ""
+          log ""
+          log "=== 内核 -Werror 必须关闭 (MTK 闭源驱动按 6.6 编写) ==="
+          if grep -qx "CONFIG_KERNEL_WERROR=y" .config; then
+            log "  FAIL CONFIG_KERNEL_WERROR=y  (toolchain/gcc/Config.version 的 imply 又把它打开了)"
+            fail=1
+          else
+            log "  OK: CONFIG_KERNEL_WERROR 已关闭"
+          fi
+
           log "=== 开源 mt76 关闭确认 ==="
           if grep -qE "^CONFIG_PACKAGE_kmod-(mt76|mt7915e|mt7981-firmware)=y" .config; then
             grep -E "^CONFIG_PACKAGE_kmod-(mt76|mt7915e|mt7981-firmware)=y" .config | tee -a "$OUT"
