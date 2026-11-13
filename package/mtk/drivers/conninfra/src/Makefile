@@ -23,7 +23,8 @@ ccflags-y += -Wframe-larger-than=1024
 ccflags-y += -Wno-error -Wno-missing-prototypes -Wno-missing-declarations \
 	-Wno-error=incompatible-pointer-types -Wno-error=int-conversion \
 	-Wno-error=return-mismatch -Wno-error=declaration-missing-parameter-type \
-	-Wno-error=implicit-int -Wno-error=enum-conversion
+	-Wno-error=implicit-int -Wno-error=enum-conversion \
+	-Wno-error=implicit-function-declaration -Wno-error=macro-redefined
 
 ###############################################################################
 MODULE_NAME := conninfra

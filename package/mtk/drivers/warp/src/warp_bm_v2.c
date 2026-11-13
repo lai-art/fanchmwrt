@@ -4,6 +4,14 @@
 #include "wdma.h"
 #include <linux/version.h>
 #include <linux/pci.h>
+/*
+ * vmalloc()/vfree() 声明在 linux/vmalloc.h。6.6 及更早可由 linux/pci.h 等
+ * 头文件间接带出, 6.12 头文件清理后不再带出, 报:
+ *   error: implicit declaration of function 'vmalloc'; did you mean 'kvmalloc'?
+ * implicit-function-declaration 在 GCC 14 属 permerror, 不能被 -Wno-error 降级;
+ * 且隐式声明会把返回的 void * 当 int 处理, 64 位下截断指针, 必须显式包含。
+ */
+#include <linux/vmalloc.h>
 
 #define DYBM_RX_EXT_POLLING_CNT	(0)//(50) /*50 times of polling approximately cost 5us */
 #define TX_BM_HTH_DELAY_INT_INTERVAL	2000	/* 2 seconds */

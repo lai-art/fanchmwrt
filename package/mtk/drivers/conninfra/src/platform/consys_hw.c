@@ -21,6 +21,9 @@
 
 #include <linux/delay.h>
 #include <linux/of_device.h>
+/* Linux 6.11 起 of_device.h 只剩前向声明, struct of_device_id 的实际定义
+ * 在 mod_devicetable.h, 6.6 靠 of_device.h 间接带出而 6.12 不再带出。 */
+#include <linux/mod_devicetable.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/clk.h>
 

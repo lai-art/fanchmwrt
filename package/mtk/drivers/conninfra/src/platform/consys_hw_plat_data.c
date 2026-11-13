@@ -7,6 +7,15 @@
 ********************************************************************************
 */
 #include <linux/of_device.h>
+/*
+ * Linux 6.11 起 include/linux/of_device.h 被精简为只含前向声明
+ * (struct of_device_id;), 真正的结构体定义在 mod_devicetable.h。
+ * 6.6 及更早版本 of_device.h 会间接带出它, 6.12 不再带出,
+ * 于是下面 apconninfra_of_ids[] 的数组元素类型变成不完整类型而编译失败:
+ *   error: array type has incomplete element type 'struct of_device_id'
+ * 显式包含以消除对头文件传递性包含的依赖。
+ */
+#include <linux/mod_devicetable.h>
 
 #include "consys_hw.h"
 
