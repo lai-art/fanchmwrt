@@ -414,6 +414,26 @@ jobs:
             done
           done < "$D/failed_packages.txt"
 
+          # ---- 下游包提前编译 ----
+          # kmod-mt_wifi 依赖 kmod-conninfra / kmod-warp, 这两个包编译失败时
+          # world 根本不会再尝试 mt_wifi。而 mt_wifi 恰好是 6.12 适配负担最重
+          # 的一块(闭源驱动, 500+ 源文件, 大量按老内核写的条件编译), 结果是
+          # 每轮 45 分钟的构建都停在同一个先决条件上, mt_wifi 的问题始终轮不到暴露。
+          #
+          # package/xxx/compile 不校验 DEPENDS(那是打包阶段的事), mt_wifi 也不
+          # 依赖 conninfra/warp 的任何头文件或 .ko, 只要内核 build_dir 已 prepare
+          # (run#19 起内核这一关已通过), 就可以独立编译。这里主动踢一脚,
+          # 把它的编译错误和本次失败一并外送, 省掉一整轮等待。
+          if grep -qE "mtk/drivers/(conninfra|warp)" "$D/failed_packages.txt" 2>/dev/null; then
+            for pb in package/mtk/drivers/mt_wifi; do
+              safe=$(printf '%s' "$pb" | tr '/' '_')
+              echo "=== 提前编译下游包 $pb (忽略依赖失败) ==="
+              timeout 2400 make "$pb/compile" V=s -j"$(nproc)" -k \
+                > "$D/pkglogs/prebuild_${safe}.log" 2>&1
+              echo "  -> 日志 $(wc -c < "$D/pkglogs/prebuild_${safe}.log") 字节"
+            done
+          fi
+
           echo "收集到文件:"; ls -lR "$D" | head -80
 
           cd "$D" || exit 0

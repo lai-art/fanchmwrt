@@ -280,15 +280,35 @@ include $(INCLUDE_DIR)/package.mk
 
 TAR_CMD=$(HOST_TAR) -C $(1)/ $(TAR_OPTIONS)
 
+# ---------------------------------------------------------------------------
+# 注意: FILES 里原本还列了 mt_warp_proxy.ko, 但在本树上它必然不会被编译出来。
+#
+#   src/mt_wifi/embedded/plug_in/Makefile:8 是
+#       obj-$(CONFIG_WHNAT_SUPPORT)+= warp_proxy/
+#   即只有 WHNAT_SUPPORT 开启才编 warp_proxy; 而 WHNAT_SUPPORT 依赖 HNAT,
+#   25.12 树内整个 HNAT 子系统已被移除(ra_sw_nat_hook_tx 等无定义),
+#   MTK_WHNAT_SUPPORT 只能为 n, 于是 mtk_warp_proxy.ko 不存在。
+#
+#   include/kernel.mk:255 对 FILES 中缺失的模块是硬失败:
+#       echo "ERROR: module '...' is missing." >&2; exit 1
+#   这会在**打包阶段**炸掉(编译阶段完全看不出来), 所以必须从 FILES/AUTOLOAD 移除。
+#
+#   warp_proxy 本用于 WED 硬件加速的旁路转发, 而本树 warp 驱动因 DTS 里
+#   wed 节点的 compatible 是 "mediatek,mt7981-wed" 而非它要找的 "mediatek,wed",
+#   本来也 probe 不上; 且 mt_wifi 主模块对 warp 没有任何运行时符号依赖
+#   (全文只有注释级引用, warp_proxy.c 也从未编入 mt_wifi_ap/Makefile),
+#   因此移除不损失 WiFi 基本功能, 仅失去 WED 加速。
+#
+#   若将来 25.12 树重新引入 HNAT 并开启 WHNAT_SUPPORT, 需把这两行恢复。
+# ---------------------------------------------------------------------------
 define KernelPackage/mt_wifi
   CATEGORY:=MTK Properties
   TITLE:=MTK wifi AP driver
   DEPENDS:=+wifi-dats
   DEPENDS+=+kmod-conninfra
-  FILES:=$(PKG_BUILD_DIR)/mt_wifi_ap/mt_wifi.ko \
-	$(PKG_BUILD_DIR)/mt_wifi/embedded/plug_in/warp_proxy/mtk_warp_proxy.ko
+  FILES:=$(PKG_BUILD_DIR)/mt_wifi_ap/mt_wifi.ko
   DEPENDS+=+kmod-warp
-  AUTOLOAD:=$(call AutoProbe,mt_wifi mtk_warp_proxy)
+  AUTOLOAD:=$(call AutoProbe,mt_wifi)
   SUBMENU:=Drivers
   MENU:=1
 endef
