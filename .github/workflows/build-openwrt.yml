@@ -118,7 +118,10 @@ jobs:
 
       - name: 配置自检
         run: |
-          echo "=== 关键选型硬校验 ==="
+          OUT=/tmp/config_check.txt
+          : > "$OUT"
+          log() { echo "$@"; echo "$@" >> "$OUT"; }
+          log "=== 关键选型硬校验 ==="
           fail=0
           for c in \
             CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-256mb-v1 \
@@ -130,32 +133,35 @@ jobs:
             CONFIG_PACKAGE_luci-app-mwrt-catcage \
             CONFIG_PACKAGE_luci-app-Airpifanctrl ; do
             if grep -qx "${c}=y" .config; then
-              echo "  OK   $c"
+              log "  OK   $c"
             else
-              echo "::error::关键选型缺失: $c"
+              log "  FAIL $c   <-- 关键选型缺失"
               fail=1
             fi
           done
-          echo
-          echo "=== 开源 mt76 关闭确认 ==="
+          log ""
+          log "=== 开源 mt76 关闭确认 ==="
           if grep -qE "^CONFIG_PACKAGE_kmod-(mt76|mt7915e|mt7981-firmware)=y" .config; then
-            grep -E "^CONFIG_PACKAGE_kmod-(mt76|mt7915e|mt7981-firmware)=y" .config
-            echo "::error::开源 mt76 仍被启用"
+            grep -E "^CONFIG_PACKAGE_kmod-(mt76|mt7915e|mt7981-firmware)=y" .config | tee -a "$OUT"
+            log "  FAIL 开源 mt76 仍被启用"
             fail=1
           else
-            echo "  OK: 无开源 mt76 相关包"
+            log "  OK: 无开源 mt76 相关包"
           fi
-          echo
-          echo "=== 配置中请求但被丢弃的包（检查是否漏编） ==="
+          log ""
+          log "=== 配置中请求但被 defconfig 丢弃的包 ==="
           drop=0
           for p in $(grep -oE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' "configs/${DEVICE_CONFIG}" | sed -E 's/^CONFIG_PACKAGE_//; s/=y$//'); do
             if ! grep -qx "CONFIG_PACKAGE_${p}=y" .config; then
-              echo "  丢弃: $p"
+              log "  DROP $p"
               drop=$((drop + 1))
             fi
           done
-          echo "共丢弃 ${drop} 项"
-          [ "$fail" -eq 0 ] || exit 1
+          log "共丢弃 ${drop} 项"
+          # 任何被丢弃的包都意味着某项功能缺失, 直接失败, 便于在 5 分钟内定位
+          [ "$drop" -eq 0 ] || fail=1
+          log "=== 自检结果: fail=${fail} ==="
+          [ "$fail" -eq 0 ]
 
       - name: 下载依赖包
         run: |
@@ -208,6 +214,7 @@ jobs:
           D=/tmp/diag
           rm -rf "$D"; mkdir -p "$D/pkglogs"
           [ -f /tmp/make.log ] && { cp -f /tmp/make.log "$D/make.log"; tail -n 800 /tmp/make.log > "$D/make_tail.log"; }
+          [ -f /tmp/config_check.txt ] && cp -f /tmp/config_check.txt "$D/config_check.txt"
           [ -f /tmp/make.log ] && grep -nE "error:|Error [0-9]+:|undefined reference|No rule to make target|collect2: error|fatal error|\*\*\* \[" /tmp/make.log > "$D/errors.txt"
           [ -f .config ] && cp -f .config "$D/dotconfig.txt"
           # OpenWrt 每包编译日志，只挑含错误的
