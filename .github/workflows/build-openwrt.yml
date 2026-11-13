@@ -164,11 +164,15 @@ jobs:
           if [ "$drop" -gt 0 ] && [ -f tmp/.config-package.in ]; then
             log ""
             log "=== 候选符号(供修正包名) ==="
-            for pat in "luci-i18n-base" "luci-app-(opkg|package-manager)" "qmi" "luci-app-fwx"; do
-              log "--- 模式: $pat"
-              grep -oE "config PACKAGE_${pat}[A-Za-z0-9_.-]*" tmp/.config-package.in \
-                | sed -E 's/^config //' | sort -u | head -30 | tee -a "$OUT"
-            done
+            log "--- luci-i18n-base 中 en/de/zh 系 ---"
+            grep -oE "config PACKAGE_luci-i18n-base-[A-Za-z0-9_-]+" tmp/.config-package.in \
+              | sed -E 's/^config //' | grep -iE "zh|_en|en$|de$" | sort -u | tee -a "$OUT"
+            log "--- luci-i18n-base-zh-cn 的 Kconfig 块 ---"
+            awk '/^config PACKAGE_luci-i18n-base-zh-cn$/{f=1} f{print} f&&/^$/{exit}' tmp/.config-package.in | tee -a "$OUT"
+            log "--- 对照 luci-i18n-base-de 的 Kconfig 块 ---"
+            awk '/^config PACKAGE_luci-i18n-base-de$/{f=1} f{print} f&&/^$/{exit}' tmp/.config-package.in | tee -a "$OUT"
+            log "--- .config 中 luci-base 现状 ---"
+            grep -E "^CONFIG_PACKAGE_luci-base=" .config | tee -a "$OUT"
           fi
           # 任何被丢弃的包都意味着某项功能缺失, 直接失败, 便于在 5 分钟内定位
           [ "$drop" -eq 0 ] || fail=1
