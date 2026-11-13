@@ -533,3 +533,27 @@ CONFIG_ZONE_DMA32=y
 CONFIG_ZSTD_COMMON=y
 CONFIG_ZSTD_COMPRESS=y
 CONFIG_ZSTD_DECOMPRESS=y
+
+# ---------------------------------------------------------------------------
+# MTK 闭源无线驱动 (mt_wifi) 所需
+#
+# generic/config-6.12 默认把 WEXT 全部关闭 (# CONFIG_WEXT_CORE is not set),
+# 官方 mt76 不需要 WEXT, 但 mt_wifi 的 ioctl 层完全建立在它之上:
+#   mt_wifi/os/linux/ap_ioctl.c:305  dev->wireless_handlers->private_args[i]
+#   mt_wifi/os/linux/ap_ioctl.c:369  static iw_handler ap_handler[]
+# 关闭时 struct net_device 不含 wireless_handlers 成员, iw_handler 类型未定义,
+# 必然编译失败。
+#
+# Linux 6.12 的依赖链 (net/wireless/Kconfig):
+#   CFG80211_WEXT  select WEXT_CORE
+#   WEXT_CORE      def_bool y, depends on CFG80211_WEXT || WIRELESS_EXT
+# 因此开启 CFG80211_WEXT 即可自动带出 WEXT_CORE。
+# 同时 mt_wifi 有完整 cfg80211 适配层(cfg80211.c 调用 wiphy_register),
+# 故 CFG80211 也必须为 y。
+# ---------------------------------------------------------------------------
+CONFIG_CFG80211=y
+CONFIG_CFG80211_WEXT=y
+CONFIG_WEXT_CORE=y
+CONFIG_WEXT_PROC=y
+CONFIG_WEXT_SPY=y
+CONFIG_WEXT_PRIV=y

@@ -141,6 +141,30 @@ jobs:
           done
           log ""
           log ""
+          log "=== MTK 驱动关键配置 (缺一即功能残缺或编不过) ==="
+          for c in \
+            CONFIG_MTK_WIFI_FW_BIN_LOAD \
+            CONFIG_MTK_WARP_V2 \
+            CONFIG_MTK_WIFI_BASIC_FUNC \
+            CONFIG_MTK_SUPPORT_OPENWRT \
+            CONFIG_MTK_CHIP_MT7981 \
+            CONFIG_MTK_DOT11_HE_AX ; do
+            if grep -qE "^${c}=(y|m)$" .config; then
+              log "  OK   $c"
+            else
+              log "  FAIL $c   <-- MTK 驱动关键配置缺失"
+              fail=1
+            fi
+          done
+          # tristate, 允许 y 或 m
+          if grep -qE "^CONFIG_MTK_MT_AP_SUPPORT=(y|m)$" .config; then
+            log "  OK   CONFIG_MTK_MT_AP_SUPPORT"
+          else
+            log "  FAIL CONFIG_MTK_MT_AP_SUPPORT   <-- AP 模式驱动不会被编译"
+            fail=1
+          fi
+
+          log ""
           log "=== 内核 -Werror 必须关闭 (MTK 闭源驱动按 6.6 编写) ==="
           if grep -qx "CONFIG_KERNEL_WERROR=y" .config; then
             log "  FAIL CONFIG_KERNEL_WERROR=y  (toolchain/gcc/Config.version 的 imply 又把它打开了)"
