@@ -154,10 +154,22 @@ jobs:
           for p in $(grep -oE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' "configs/${DEVICE_CONFIG}" | sed -E 's/^CONFIG_PACKAGE_//; s/=y$//'); do
             if ! grep -qx "CONFIG_PACKAGE_${p}=y" .config; then
               log "  DROP $p"
+              grep -E "^CONFIG_PACKAGE_${p}=" .config | sed 's/^/       现状: /' | tee -a "$OUT"
               drop=$((drop + 1))
             fi
           done
           log "共丢弃 ${drop} 项"
+
+          # 丢弃时给出候选符号名, 避免再去猜包名
+          if [ "$drop" -gt 0 ] && [ -f tmp/.config-package.in ]; then
+            log ""
+            log "=== 候选符号(供修正包名) ==="
+            for pat in "luci-i18n-base" "luci-app-(opkg|package-manager)" "qmi" "luci-app-fwx"; do
+              log "--- 模式: $pat"
+              grep -oE "config PACKAGE_${pat}[A-Za-z0-9_.-]*" tmp/.config-package.in \
+                | sed -E 's/^config //' | sort -u | head -30 | tee -a "$OUT"
+            done
+          fi
           # 任何被丢弃的包都意味着某项功能缺失, 直接失败, 便于在 5 分钟内定位
           [ "$drop" -eq 0 ] || fail=1
           log "=== 自检结果: fail=${fail} ==="
