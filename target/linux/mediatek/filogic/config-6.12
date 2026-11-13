@@ -535,25 +535,31 @@ CONFIG_ZSTD_COMPRESS=y
 CONFIG_ZSTD_DECOMPRESS=y
 
 # ---------------------------------------------------------------------------
-# MTK 闭源无线驱动 (mt_wifi) 所需
+# MTK 闭源无线驱动 (mt_wifi) 所需: 原生 Wireless Extensions
 #
-# generic/config-6.12 默认把 WEXT 全部关闭 (# CONFIG_WEXT_CORE is not set),
-# 官方 mt76 不需要 WEXT, 但 mt_wifi 的 ioctl 层完全建立在它之上:
-#   mt_wifi/os/linux/ap_ioctl.c:305  dev->wireless_handlers->private_args[i]
-#   mt_wifi/os/linux/ap_ioctl.c:369  static iw_handler ap_handler[]
-# 关闭时 struct net_device 不含 wireless_handlers 成员, iw_handler 类型未定义,
-# 必然编译失败。
+# generic/config-6.12 默认把 WEXT 全部关闭, 官方 mt76 走 cfg80211 不需要它;
+# 但 mt_wifi 是老式 WEXT 驱动, ioctl 层直接建在 net_device 上:
+#   os/linux/ap_ioctl.c:305  dev->wireless_handlers->private_args[i]
+#   os/linux/ap_ioctl.c:369  static iw_handler ap_handler[]
 #
-# Linux 6.12 的依赖链 (net/wireless/Kconfig):
-#   CFG80211_WEXT  select WEXT_CORE
-#   WEXT_CORE      def_bool y, depends on CFG80211_WEXT || WIRELESS_EXT
-# 因此开启 CFG80211_WEXT 即可自动带出 WEXT_CORE。
-# 同时 mt_wifi 有完整 cfg80211 适配层(cfg80211.c 调用 wiphy_register),
-# 故 CFG80211 也必须为 y。
+# 注意区别 (Linux 6.12 net/wireless/Kconfig + include/linux/netdevice.h):
+#   struct net_device 的 wireless_handlers/wireless_data 成员由
+#   CONFIG_WIRELESS_EXT 控制 (netdevice.h:2151), 与 WEXT_CORE 是两个符号;
+#   WEXT_CORE 只是 net/wireless/wext-core.o 的编译开关。
+#   因此 WEXT_CORE=y 但 WIRELESS_EXT=n 时, 成员不存在, 编译必失败。
+#
+# 关键: 不要开 CONFIG_CFG80211=y。cfg80211 在 OpenWrt 里由 mac80211
+# backports 包 (kmod-cfg80211) 以模块形式提供, 25.12 的 generic config
+# 就是 "# CONFIG_CFG80211 is not set"。强行内建会让内核去编 net/wireless
+# 整棵子树, 与 backports 方案冲突, 也偏离厂家基线的做法。
+# 厂家 6.6 基线 (fanchmwrt-256M/target/linux/generic/config-6.6:7459-7466)
+# 正是 WEXT_*=y + WIRELESS_EXT=y + CFG80211 关闭, 此处照此对齐。
 # ---------------------------------------------------------------------------
-CONFIG_CFG80211=y
-CONFIG_CFG80211_WEXT=y
+CONFIG_WIRELESS=y
+CONFIG_WIRELESS_EXT=y
 CONFIG_WEXT_CORE=y
 CONFIG_WEXT_PROC=y
 CONFIG_WEXT_SPY=y
 CONFIG_WEXT_PRIV=y
+# CONFIG_CFG80211 is not set
+# CONFIG_CFG80211_WEXT is not set

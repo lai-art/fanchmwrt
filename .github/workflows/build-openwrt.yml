@@ -249,12 +249,66 @@ jobs:
           echo "=== 怀疑下载不完整的文件 (<1KB) ==="
           find dl -size -1024c -exec ls -l {} \; 2>/dev/null || true
 
+      - name: 内核配置预检
+        run: |
+          set +e
+          echo "=== 生成内核配置 (prepare + configure) ==="
+          make target/linux/configure V=s 2>&1 | tail -80
+          echo "target/linux/configure 退出码: $?"
+          KC=$(ls -t build_dir/target-*/linux-filogic/linux-*/.config 2>/dev/null | head -1)
+          echo "内核 .config: ${KC:-<未生成>}"
+          if [ -z "$KC" ]; then
+            echo "!! 内核 .config 未生成, prepare/configure 阶段已失败"
+            exit 1
+          fi
+          fail=0
+          echo "=== WEXT 必须项 (mt_wifi 的 ioctl 层建在 net_device 上) ==="
+          for s in CONFIG_WIRELESS CONFIG_WIRELESS_EXT CONFIG_WEXT_CORE CONFIG_WEXT_PROC CONFIG_WEXT_SPY CONFIG_WEXT_PRIV; do
+            v=$(grep -m1 -E "^# ${s} is not set|^${s}=" "$KC")
+            if [ "$v" = "$s=y" ]; then
+              echo "  OK   $v"
+            else
+              echo "  FAIL ${s}  实际: ${v:-<符号不存在>}  <-- wireless_handlers 成员会缺失, mt_wifi 必编译失败"
+              fail=1
+            fi
+          done
+          echo "=== cfg80211 必须由 mac80211 backports 提供, 内核侧不内建 ==="
+          for s in CONFIG_CFG80211 CONFIG_CFG80211_WEXT; do
+            v=$(grep -m1 -E "^# ${s} is not set|^${s}=" "$KC")
+            case "$v" in
+              "$s=y"|"$s=m") echo "  FAIL $v  内核内建会与 backports 包冲突"; fail=1 ;;
+              *) echo "  OK   ${v:-$s 未设置}" ;;
+            esac
+          done
+          {
+            echo "kernel_config=$KC"
+            grep -E "^# (CONFIG_WIRELESS|CONFIG_WEXT|CONFIG_CFG80211)|^(CONFIG_WIRELESS|CONFIG_WEXT|CONFIG_CFG80211)" "$KC"
+            echo "fail=$fail"
+          } > /tmp/kernel_check.txt
+          echo "=== 预检结果: fail=$fail ==="
+          exit $fail
+
       - name: 编译固件
         id: build
         run: |
-          set -o pipefail
           echo "并行任务数: $(nproc)"
-          make -j"$(nproc)" 2>&1 | tee /tmp/make.log
+          # 后台记录资源曲线: 内核并行编译最容易磁盘满或 OOM, 而这两者
+          # 在 make 日志里往往只表现为一句无上下文的失败。
+          ( while true; do
+              echo "--- $(date -u +%H:%M:%S)"
+              df -h / | tail -1
+              free -m | sed -n '2p'
+              sleep 120
+            done ) > /tmp/resmon.log 2>&1 &
+          MON=$!
+          # V=s: world 在默认等级下会把 target/linux 子 make 的输出整个吞掉,
+          # 内核失败时日志里只剩一句 "target/linux failed to build", 无从定位。
+          make -j"$(nproc)" V=s > /tmp/make.log 2>&1
+          rc=$?
+          kill $MON 2>/dev/null || true
+          echo "make 退出码: $rc"
+          echo "日志大小: $(wc -c < /tmp/make.log) 字节 / $(wc -l < /tmp/make.log) 行"
+          exit $rc
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
 
@@ -300,13 +354,43 @@ jobs:
             echo "ref=${{ github.ref_name }}"
             echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "$D/run_info.txt"
-          [ -f /tmp/make.log ] && { cp -f /tmp/make.log "$D/make.log"; tail -n 1500 /tmp/make.log > "$D/make_tail.log"; }
+          # V=s 的完整日志可达数百 MB, 整份塞进 git 会超 GitHub 单文件 100MB 限制,
+          # 只保留尾部上下文 + 提取后的错误行。
+          if [ -f /tmp/make.log ]; then
+            tail -n 8000 /tmp/make.log > "$D/make_tail.log"
+            ls -l /tmp/make.log | awk '{print "make.log 原始大小: "$5" 字节"}'
+          fi
           [ -f /tmp/config_check.txt ] && cp -f /tmp/config_check.txt "$D/config_check.txt"
+          [ -f /tmp/kernel_check.txt ] && cp -f /tmp/kernel_check.txt "$D/kernel_check.txt"
           [ -f .config ] && cp -f .config "$D/dotconfig.txt"
+
+          # 环境快照: 内核并行编译极易 OOM, 也常因磁盘满静默失败
+          { echo "=== df -h ==="; df -h / /tmp 2>/dev/null; echo; echo "=== free -m ==="; free -m; echo; echo "=== nproc ==="; nproc; } > "$D/env.txt" 2>&1
+          [ -f /tmp/resmon.log ] && tail -n 120 /tmp/resmon.log > "$D/resmon.txt"
 
           # 摘要: 原始日志里 Error N 后面没有冒号, 旧规则 "Error [0-9]+:" 从未命中
           if [ -f /tmp/make.log ]; then
-            grep -nE "error:|undefined reference|No rule to make target|collect2:|fatal error|\*\*\* |ERROR: package/" /tmp/make.log > "$D/errors.txt"
+            grep -nE "error:|undefined reference|No rule to make target|collect2:|fatal error|\*\*\* |ERROR: |Killed|No space left|Hunk .* FAILED|Patch failed" /tmp/make.log > "$D/errors.txt"
+          fi
+
+          # target/linux(内核) 失败: 兜底。V=s 日志已能覆盖大部分情况,
+          # 只有提取不到任何内核错误时才花 50 分钟重编。
+          if grep -q "target/linux failed to build" /tmp/make.log 2>/dev/null; then
+            KERR=$(wc -l < "$D/errors.txt" 2>/dev/null || echo 0)
+            echo "=== 内核失败, V=s 日志中已提取错误行: $KERR ==="
+            if [ "$KERR" -eq 0 ]; then
+              echo "=== 日志无内核细节, V=sc 重编 target/linux ==="
+              KLOG=/tmp/kernel_rebuild.log
+              timeout 3300 make target/linux/compile V=sc -k -j"$(nproc)" > "$KLOG" 2>&1
+              echo "  -> 内核重编日志 $(wc -c < "$KLOG") 字节"
+              grep -nE "error:|Error [0-9]|fatal error|\*\*\* |Killed|No space left|Hunk .* FAILED|Patch failed|undefined reference|cannot find|No such file" "$KLOG" \
+                | head -600 > "$D/kernel_errors.txt" 2>/dev/null || true
+              tail -n 3000 "$KLOG" > "$D/pkglogs/kernel_tail.log" 2>/dev/null || true
+            fi
+            # 内核最终 .config, 用于比对 config-6.12 是否真的生效
+            for c in build_dir/target-*/linux-filogic/linux-*/.config; do
+              [ -f "$c" ] && cp -f "$c" "$D/kernel_dotconfig.txt" && break
+            done
           fi
 
           # 找出失败的包, 每个用 V=s 单线程重编, 拿到真正的编译错误
