@@ -8,7 +8,9 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=warp
 
-PKG_VERSION:=20221209-3e6ae1
+# 厂家原值为 20221209-3e6ae1(日期-git 哈希)。apk 版本不允许连字符，
+# 保留日期部分，哈希记在此处。
+PKG_VERSION:=20221209
 
 MT7981_NEW_WOFW_DIR := mt7981-fw-20231228
 MT7986_NEW_WOFW_DIR := mt7986-fw-20230808

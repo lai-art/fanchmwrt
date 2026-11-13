@@ -20,7 +20,9 @@ endif
 endif
 
 PKG_BUILD_DEPENDS:=warp
-PKG_VERSION:=7.6.6.1-$(PKG_SUFFIX)
+# 厂家原值为 7.6.6.1-$(PKG_SUFFIX)(如 7.6.6.1-mt7981)。apk 版本不允许连字符，
+# 去掉后缀(它只参与版本号，不影响编译与固件目录)。
+PKG_VERSION:=7.6.6.1
 
 PKG_BUILD_PARALLEL:=1
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)

@@ -9,7 +9,11 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=conninfra
-PKG_VERSION:=bbf588
+# 厂家原值为 bbf588(git 短哈希)。apk 的版本语法只允许
+# number{.number}...{letter}{_suffix}{~hash}{-r#}，点号分隔的字母段会拼成
+# 6.12.112.bbf588-r1，被 apk 判为 "package version is invalid" 直接失败。
+# 故置空，版本回落到 6.12.112-r1。
+PKG_VERSION:=
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
 PKG_MAINTAINER:=Kun-Ze Syue<kun-ze.syue@mediatek.com>
 

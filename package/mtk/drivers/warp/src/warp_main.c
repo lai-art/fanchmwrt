@@ -36,6 +36,17 @@
 
 #define WED0_DEV_NODE "mediatek,wed"
 #define WED1_DEV_NODE "mediatek,wed2"
+
+/* wifi_tx_tuple_add / wifi_rx_tuple_add 只在 warp_wifi.c 的 HNAT 条件块
+ * (该文件第 28~181 行)内才有定义。OpenWrt 25.12 树内没有 HNAT 实现
+ * (files-6.12/include/net/ra_nat.h 只有声明, 无处定义 ra_sw_nat_hook_tx),
+ * 这时两个函数不参与编译, 若仍无条件调用会在 modpost 阶段报 undefined。
+ * 没有 HNAT 也就没有 FOE 表项可写, 跳过这段元组编程在语义上是对的。
+ */
+#if defined(CONFIG_HW_NAT) || defined(CONFIG_RA_NAT_HW) || \
+	defined(CONFIG_NET_MEDIATEK_HNAT) || defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
+#define WARP_HNAT_AVAILABLE	1
+#endif
 /*
 * extern functions from other files
 */
@@ -1208,7 +1219,11 @@ warp_wlan_tx(void *priv_data, unsigned char *tx_info)
 		u32 wdma_rx_port = warp->wdma.wdma_rx_port;
 
 		if (warp->cfg.hw_tx_en)
+#ifdef WARP_HNAT_AVAILABLE
 			ret = wifi_tx_tuple_add(&warp->wifi, warp->idx, tx_info, wdma_rx_port);
+#else
+			(void)wdma_rx_port;
+#endif
 	}
 #endif /*WED_HW_TX_SUPPORT*/
 
@@ -1228,7 +1243,11 @@ warp_wlan_rx(void *priv_data, unsigned char *rx_info)
 		return;
 
 #ifdef WED_HW_RX_SUPPORT
+#ifdef WARP_HNAT_AVAILABLE
 	wifi_rx_tuple_add(&warp->wifi, warp->idx, rx_info);
+#else
+	(void)rx_info;
+#endif
 #endif
 #endif
 }
