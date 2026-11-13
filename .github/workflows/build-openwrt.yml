@@ -144,7 +144,6 @@ jobs:
           log "=== MTK 驱动关键配置 (缺一即功能残缺或编不过) ==="
           for c in \
             CONFIG_MTK_WIFI_FW_BIN_LOAD \
-            CONFIG_MTK_WARP_V2 \
             CONFIG_MTK_WIFI_BASIC_FUNC \
             CONFIG_MTK_SUPPORT_OPENWRT \
             CONFIG_MTK_CHIP_MT7981 \
@@ -162,6 +161,28 @@ jobs:
           else
             log "  FAIL CONFIG_MTK_MT_AP_SUPPORT   <-- AP 模式驱动不会被编译"
             fail=1
+          fi
+          # warp 是 int/string 型配置, 必须逐项比对取值。
+          # 注意: MTK_WARP_V2 依赖 MTK_WHNAT_SUPPORT -> MTK_FAST_NAT_SUPPORT -> HNAT 包,
+          # 25.12 树内已无 HNAT(ra_sw_nat_hook_tx 无实现), 故 MTK_WARP_V2 必须为 n,
+          # 不能作为门禁项。真正决定 warp 编译分支的是 WARP_VERSION / WARP_CHIPSET。
+          if grep -qx "CONFIG_WARP_VERSION=2" .config; then
+            log "  OK   CONFIG_WARP_VERSION=2"
+          else
+            log "  FAIL CONFIG_WARP_VERSION != 2 (filogic 下 default 取不到值, 会错编成 MT7988 的 V3)"
+            fail=1
+          fi
+          if grep -qE '^CONFIG_WARP_CHIPSET="mt7981"$' .config; then
+            log "  OK   CONFIG_WARP_CHIPSET=mt7981"
+          else
+            log "  FAIL CONFIG_WARP_CHIPSET != mt7981 (default 是 mt7988)"
+            fail=1
+          fi
+          if grep -qx "CONFIG_MTK_WHNAT_SUPPORT=y" .config; then
+            log "  FAIL CONFIG_MTK_WHNAT_SUPPORT=y   <-- 树内无 HNAT 实现, 必然链接失败"
+            fail=1
+          else
+            log "  OK   CONFIG_MTK_WHNAT_SUPPORT 已关闭 (树内无 HNAT)"
           fi
 
           log ""
