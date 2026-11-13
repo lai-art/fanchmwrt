@@ -288,6 +288,19 @@ jobs:
           fi
           [ "$bad" -eq 0 ]
 
+      - name: 补丁行尾一致性预检
+        run: |
+          # 仓库 .gitattributes 是 '* -text', git 完全不转换行尾, 工作区是什么样
+          # 提交进库就是什么样。而 patches/*.patch 全是 LF —— 一旦有人用编辑器或
+          # 脚本改被 patch 的目标文件, 把整文件变成 CRLF, GNU patch 会在
+          # Build/Prepare 阶段报:
+          #   005-use-ext-warp-code.patch: Hunk #1 FAILED at 12 (different line endings)
+          # 报错指向 patch 而不是源文件, 极难定位, 而且要等前面所有包编完
+          # (约 90 分钟) 才暴露。这里几秒内直接比对。
+          #
+          # 注意: 不要用 grep -q $'\r' 判断行尾, Git Bash 下会把 LF 文件误报成 CRLF。
+          python3 scripts/ci/check-patch-eol.py .
+
       - name: 预置 MTK 源码包
         run: |
           # datconf 的 Makefile 只有 PKG_SOURCE 和 PKG_REVISION, 没有 PKG_SOURCE_URL,
