@@ -461,7 +461,20 @@ jobs:
             grep -oE "ERROR: package/[^ ]+ failed to build" /tmp/make.log \
               | sed -E 's/^ERROR: //; s/ failed to build$//' | sort -u > "$D/failed_packages.txt"
           fi
-          echo "=== 失败包 ==="; cat "$D/failed_packages.txt"
+          # -k 之后一轮可能同时暴露十几个失败包, 而每个包 V=s 单线程重编最多
+          # 要 20 分钟, job 总共只有 350 分钟。这里做两件事:
+          #   1) 完整列表另存为 failed_packages_all.txt, 信息不丢;
+          #   2) 重编清单优先排 mtk/drivers (mt_wifi 是 6.12 适配最大的未知数),
+          #      其余按原顺序补齐, 总数上限 8 个。
+          if [ -s "$D/failed_packages.txt" ]; then
+            cp -f "$D/failed_packages.txt" "$D/failed_packages_all.txt"
+            { grep "mtk/drivers" "$D/failed_packages.txt" || true
+              grep -v "mtk/drivers" "$D/failed_packages.txt" || true
+            } | awk '!u[$0]++' | head -8 > "$D/rebuild_list.txt"
+            mv -f "$D/rebuild_list.txt" "$D/failed_packages.txt"
+          fi
+          echo "=== 全部失败包 ==="; cat "$D/failed_packages_all.txt" 2>/dev/null || true
+          echo "=== 本轮将重编 ==="; cat "$D/failed_packages.txt"
 
           while IFS= read -r pkg; do
             [ -n "$pkg" ] || continue
