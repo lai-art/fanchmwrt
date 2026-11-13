@@ -288,6 +288,31 @@ jobs:
           fi
           [ "$bad" -eq 0 ]
 
+      - name: 预置 MTK 源码包
+        run: |
+          # datconf 的 Makefile 只有 PKG_SOURCE 和 PKG_REVISION, 没有 PKG_SOURCE_URL,
+          # 源码只能从 dl/ 里取。厂家原树的 dl/ 带着 datconf-6bb733f7.tar.bz2,
+          # 而这棵移植树没有 dl/, 于是要等到 Build/Prepare 解包时才报:
+          #   bzcat: Can't open input file .../dl/datconf-6bb733f7.tar.bz2
+          #   tar: This does not look like a tar archive
+          # 完全看不出是"缺源码"。这个包只有 12.8 KB, 直接随仓库携带(mtk-src/),
+          # 不依赖任何外部地址, 也就不存在下载失败/截断的问题。
+          mkdir -p dl
+          if [ -d mtk-src ]; then
+            cp -fv mtk-src/*.tar.* dl/ 2>/dev/null || true
+          fi
+          echo "=== dl/ 中的预置源码包 ==="
+          ls -l dl/*.tar.* 2>/dev/null || echo "(无)"
+          # 完整性校验: 截断的压缩包同样非空, 只判 -s 会放行到编译阶段才炸
+          for f in dl/*.tar.bz2; do
+            [ -f "$f" ] || continue
+            bzip2 -t "$f" 2>/dev/null && echo "OK  $f" || echo "::error::$f 校验失败"
+          done
+          for f in dl/*.tar.xz; do
+            [ -f "$f" ] || continue
+            xz -t "$f" 2>/dev/null && echo "OK  $f" || echo "::error::$f 校验失败"
+          done
+
       - name: 下载依赖包
         run: |
           make download -j8 || make download -j1 V=s

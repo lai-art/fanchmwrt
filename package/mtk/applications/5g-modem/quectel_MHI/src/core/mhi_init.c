@@ -644,7 +644,9 @@ static int mon_text_release(struct inode *inode, struct file *file)
 static const struct file_operations mon_fops_text_u = {
 	.owner =	THIS_MODULE,
 	.open =		mon_text_open,
-	.llseek =	no_llseek,
+	/* no_llseek 在 6.12 被移除; noop_llseek 从 2.6.35 起就存在,
+	 * 语义是“seek 不做任何事, 返回当前位置”, 正是 debugfs 这类文件需要的。 */
+	.llseek =	noop_llseek,
 	.read =		mon_text_read_u,
 	.release =	mon_text_release,
 };
@@ -2366,10 +2368,21 @@ void mhi_unprepare_after_power_down(struct mhi_controller *mhi_cntrl)
 }
 
 /* match dev to drv */
+/*
+ * 6.11 起 struct bus_type::match 的第二个参数是 const struct device_driver *
+ * (commit d69d80484598 "driver core: have match() callback in struct bus_type
+ * take a const *")。函数指针类型必须精确匹配, 否则 .match = mhi_match
+ * 初始化时 -Wincompatible-pointer-types 会变成硬错误(GCC 14 起)。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+static int mhi_match(struct device *dev, const struct device_driver *drv)
+#else
 static int mhi_match(struct device *dev, struct device_driver *drv)
+#endif
 {
 	struct mhi_device *mhi_dev = to_mhi_device(dev);
-	struct mhi_driver *mhi_drv = to_mhi_driver(drv);
+	/* container_of 会丢弃 const, 这里显式转换; 本函数只读 driver 不修改 */
+	struct mhi_driver *mhi_drv = to_mhi_driver((struct device_driver *)drv);
 	const struct mhi_device_id *id;
 
 	/* if controller type there is no client driver associated with it */

@@ -11,8 +11,28 @@
  */
 
 #include <linux/module.h>
+
 #include <linux/version.h>
-#include <linux/interrupt.h>
+
+/*
+ * ---- Linux 6.12 兼容层 ----
+ * u64_stats_fetch_begin_irq() / u64_stats_fetch_retry_irq():
+ *   6.1 起被标记为 obsolete(那时只是 inline 包装到非 _irq 版本),
+ *   6.12 彻底删除(commit d120d1a63b2c "net: Remove the obsolete
+ *   u64_stats_fetch_*_irq() users") 。32 位平台现在也一律使用 seqcount,
+ *   不再需要 _irq 变体, 直接映射到非 _irq 版本。
+ * strlcpy():
+ *   5.19 移除, 用 strscpy() 替代。本文件的调用都不使用
+ *   返回值, 且目标缓冲区都保证 NUL 结尾, 语义等价。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#define u64_stats_fetch_begin_irq(p)		u64_stats_fetch_begin(p)
+#define u64_stats_fetch_retry_irq(p, s)		u64_stats_fetch_retry(p, s)
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+#define strlcpy(dst, src, size)			strscpy(dst, src, size)
+#endif#include <linux/interrupt.h>
 #include <linux/netdevice.h>
 #include <linux/ethtool.h>
 #include <linux/etherdevice.h>

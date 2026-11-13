@@ -46,4 +46,15 @@ define Package/luci-zh-cn-support/install
 	true
 endef
 
+# 纯元包还必须把默认的 Build/Prepare 与 Build/Compile 清空。
+# 否则 package.mk 的默认实现会建一个空构建目录然后执行 `make -C <dir> .`,
+# 而这个目录里既没有源码也没有 Makefile, 报:
+#   make[3]: *** No targets specified and no makefile found.  Stop.
+# 报错还指向 build_dir 而不是本包, 很容易被误判成工具链问题。
+define Build/Prepare
+endef
+
+define Build/Compile
+endef
+
 $(eval $(call BuildPackage,luci-zh-cn-support))
