@@ -1,4 +1,5 @@
 ccflags-y += $(MODULE_FLAGS) -Inet/nat -I$(PKG_BUILD_DIR)../warp -I$(PKG_BUILD_DIR)../warp/mcu -DCONFIG_WARP_VERSION=$(CONFIG_WARP_VERSION)
+ccflags-y += -Wno-missing-prototypes
 
 ifeq ($(CONFIG_WARP_ATC_SUPPORT), y)
 ccflags-y += -DCONFIG_WARP_ATC_SUPPORT

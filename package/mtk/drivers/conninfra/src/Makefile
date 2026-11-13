@@ -15,6 +15,9 @@ ccflags-y += -Werror
 ccflags-y += -Wno-error=format
 ccflags-y += -Wno-error=format-extra-args
 ccflags-y += -Wframe-larger-than=1024
+# Linux 6.12 默认启用 -Wmissing-prototypes, 与本包的 -Werror 组合会让
+# 大量老代码的 "no previous prototype" 警告变成硬错误。
+ccflags-y += -Wno-missing-prototypes
 
 ###############################################################################
 MODULE_NAME := conninfra
