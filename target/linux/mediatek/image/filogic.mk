@@ -1269,7 +1269,7 @@ define Device/cudy_tr3000-256mb-v1
   IMAGE_SIZE := 235520k
   KERNEL_IN_UBI := 1
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
-  DEVICE_PACKAGES := kmod-usb3 kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware
+  DEVICE_PACKAGES := kmod-usb3 mt7981-wo-firmware kmod-mt_wifi
 endef
 TARGET_DEVICES += cudy_tr3000-256mb-v1
 

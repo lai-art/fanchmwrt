@@ -1,0 +1,50 @@
+#!/bin/sh
+#
+# 99-aurora-skin —— aurora 浅色皮肤 header.ut 注入（uci-defaults，首次启动执行一次）
+#
+# 把 aurora 三件套注入到 luci-base 的全局模板 header.ut，
+# 插在 include(themes/${theme}/header) 之后（body 开头，先于首次绘制）。
+# 仅对 argon 主题输出，避免压坏其他主题样式。
+#
+
+HEADER=/usr/share/ucode/luci/template/header.ut
+MARK="mwrt-aurora-skin:begin"
+
+[ -f "$HEADER" ] || exit 0
+
+# 已注入则跳过（幂等）
+grep -q "$MARK" "$HEADER" && exit 0
+
+# 找不到主题 include 锚点则放弃
+grep -qF 'include(`themes/${theme}/header`)' "$HEADER" || exit 0
+
+# busybox sed -i 插多行不可靠，用 awk
+awk '
+/^-%\}/ && !done {
+	print
+	print "{# mwrt-aurora-skin:begin  aurora skin (argon only) #}"
+	print "{% if (theme == \"argon\"): %}"
+	print "<script src=\"{{ resource }}/mwrt-aurora-boot.js\"></script>"
+	print "<link rel=\"stylesheet\" href=\"{{ resource }}/mwrt-aurora-full.css\">"
+	print "<link rel=\"stylesheet\" href=\"{{ resource }}/mwrt-aurora-chrome.css\">"
+	print "{% endif %}"
+	print "{# mwrt-aurora-skin:end #}"
+	done = 1
+	next
+}
+{ print }
+' "$HEADER" > "$HEADER.tmp" || exit 0
+
+# 注入后校验，失败则回滚
+if ! grep -q "$MARK" "$HEADER.tmp"; then
+	rm -f "$HEADER.tmp"
+	exit 0
+fi
+
+mv "$HEADER.tmp" "$HEADER"
+
+# 清 luci 缓存
+rm -f /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+
+exit 0

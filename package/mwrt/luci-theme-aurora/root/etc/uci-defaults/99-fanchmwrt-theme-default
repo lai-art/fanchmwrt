@@ -1,0 +1,18 @@
+#!/bin/sh
+#
+# 99-fanchmwrt-theme-default —— 确保默认主题为 Argon（从原固件提取的版本）
+#
+# 原固件默认跑 Argon + Aurora 叠加皮肤。本仓库同时带了 fanchmwrt 自带主题，
+# 若它的 uci-defaults 后执行会把默认主题抢走，这里统一兜底设回 argon。
+# argon 资源不存在时直接退出，避免把 mediaurlbase 指到空目录导致白屏。
+#
+
+[ -d /www/luci-static/argon ] || exit 0
+
+uci -q get luci.themes.Argon >/dev/null 2>&1 || \
+	uci set luci.themes.Argon=/luci-static/argon
+
+uci set luci.main.mediaurlbase=/luci-static/argon
+uci commit luci
+
+exit 0

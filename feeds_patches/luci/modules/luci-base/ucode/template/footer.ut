@@ -1,0 +1,70 @@
+{#
+ Copyright 2022 Jo-Philipp Wich <jo@mein.io>
+ Licensed to the public under the Apache License 2.0.
+-#}
+
+{% const rollback = dispatcher.rollback_pending() %}
+{% if (rollback || trigger_apply || trigger_revert): %}
+	<script>
+		document.addEventListener("luci-loaded", function() {
+			{% if (trigger_apply): %}
+				L.ui.changes.apply(true);
+			{% elif (trigger_revert): %}
+				L.ui.changes.revert();
+			{% else %}
+				L.ui.changes.confirm(true, Date.now() + {{rollback.remaining * 1000}}, {{sprintf('%J', rollback.token)}});
+			{% endif %}
+		});
+	</script>
+{% endif %}
+
+{% if (media_error): %}
+	<script>
+		L.require('ui').then(function(ui) {
+			ui.showIndicator('media_error', _('Theme fallback'), function(ev) {
+				ui.showModal(_('Error loading theme'), [
+					E('p', [
+						_('A fallback is used since the configured theme failed to load with the error below.')
+					]),
+					E('hr'),
+					E('div', { 'style': 'white-space:pre-line' }, {{ sprintf('%J', trim(media_error)) }}),
+					E('div', { 'class': 'right' }, [
+						E('button', { 'class': 'btn cbi-button', 'click': ui.hideModal }, _('Dismiss'))
+					])
+				]);
+			});
+		});
+	</script>
+{% endif %}
+
+{# mwrt-catcage:begin #}
+{%
+  // 侧栏「笼中猫」破笼动画 + 插件解锁框（luci-app-mwrt-catcage 提供资源与路由）。
+  // 登录页也会渲染 footer，但未登录时 rpc 全 403、这些脚本没有意义，所以只给已登录页面。
+  // 本段不含任何外部服务器地址：解锁判定与状态查询都走设备本地路由。
+  let _cc_show = false;
+  try { _cc_show = !!ctx?.authsession; } catch (_e) { _cc_show = false; }
+
+  // 已解锁且用户把「桌面猫咪」关掉时（uci mwrt.@ndis[0].catshow = 0），只隐藏玩偶猫，
+  // 不下发动画脚本；未解锁时笼中猫是解锁入口，不受此开关控制。
+  let _cc_hide = false;
+  if (_cc_show) {
+    try {
+      if (require("uci").cursor().get_first("mwrt", "ndis", "catshow") == "0")
+        _cc_hide = (require("fs").readfile("/etc/config/Outofnetwork", 4) ?? "").substring(0, 2) == "ok";
+    } catch (_e) { _cc_hide = false; }
+  }
+%}
+{% if (_cc_show): %}
+	<script>window.MwrtUi = Object.assign(window.MwrtUi || {}, { cathide: {{ _cc_hide ? 1 : 0 }} });</script>
+	<script src="{{ resource }}/mwrt-unlock.js?v=1-{{ pkgs_update_time }}" data-url="{{ dispatcher.build_url('admin/Outofnetwork') }}"></script>
+{% if (!_cc_hide): %}
+	<script src="{{ resource }}/mwrt-cat-art.js?v=1-{{ pkgs_update_time }}"></script>
+	<script src="{{ resource }}/mwrt-catcage.js?v=1-{{ pkgs_update_time }}" data-state="{{ dispatcher.build_url('admin/modem/unlock_state') }}"></script>
+{% endif %}
+{% endif %}
+{# mwrt-catcage:end #}
+
+{% include(`themes/${theme}/footer`) %}
+
+<!-- Lua compatibility mode active: {{ lua_active ? 'yes' : 'no' }} -->
