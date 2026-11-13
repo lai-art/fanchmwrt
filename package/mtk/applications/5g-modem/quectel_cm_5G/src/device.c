@@ -435,8 +435,16 @@ int mhidevice_detect(char *qmichannel, char *usbnet_adapter, PROFILE_T *profile)
                 continue;
             }
 
-            char *d_name[32];
-            strcpy(d_name, ent->d_name);
+            /* 原来是 char *d_name[32]; —— 那声明的是 32 个指针, 不是 32 字节的
+             * 字符缓冲区。strcpy 会把设备名当成指针值写进指针数组本身, 直接把栈
+             * 上的指针改坏; 随后的 replaceStr 内部又是 strcpy(str, buffer) 写回。
+             * GCC <= 13 对此只报 -Wincompatible-pointer-types 警告, GCC 14 把它
+             * 升级为 error 才暴露出来。这里改成真正的字符数组。
+             * 尺寸取 NAME_MAX+1: ent->d_name 最长 255, replaceStr 写回时会
+             * 复制整串(替换 "_IP_HW0" 为空只会更短), 256 足够且不会截断。
+             */
+            char d_name[256] = {'\0'};
+            snprintf(d_name, sizeof(d_name), "%s", ent->d_name);
             replaceStr(d_name, "_IP_HW0", "");
             dbg_time("while -> pcie_name = : %s ", d_name);
 

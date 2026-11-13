@@ -344,7 +344,10 @@ jobs:
           MON=$!
           # V=s: world 在默认等级下会把 target/linux 子 make 的输出整个吞掉,
           # 内核失败时日志里只剩一句 "target/linux failed to build", 无从定位。
-          make -j"$(nproc)" V=s > /tmp/make.log 2>&1
+          # -k: 遇错继续编译其它包。厂家代码是逐包适配的, 不加 -k 时 world 会在
+          # 第一个失败包处停止启动新目标, 每 40~90 分钟只能暴露一个包的问题;
+          # 加 -k 后一轮就能拿到全部失败包, 由下面的诊断步骤逐个 V=s 重编。
+          make -j"$(nproc)" V=s -k > /tmp/make.log 2>&1
           rc=$?
           kill $MON 2>/dev/null || true
           echo "make 退出码: $rc"
@@ -415,6 +418,22 @@ jobs:
           if [ -f /tmp/make.log ]; then
             grep -nE "error:|undefined reference|No rule to make target|collect2:|fatal error|\*\*\* |ERROR: |Killed|No space left|Hunk .* FAILED|Patch failed" /tmp/make.log > "$D/errors.txt"
           fi
+
+          # 编译进度摘要。
+          # 只看 failed_packages.txt 很容易误判: 失败包只有一个, 并不代表其余包都
+          # 编过了 —— world 在第一个失败处就会停止启动新目标(run#23 就是这种情况,
+          # 4MB 日志里 package/mtk/drivers 下的三个包出现 0 次, mt_wifi 根本没编到)。
+          # 这里把"真正编完的包"和"关键包是否被触及"明确写出来。
+          {
+            echo "=== 编完的包 (有 time: .../compile 统计行的) 共 $(grep -oE '^time: package/[^#]+/compile' /tmp/make.log 2>/dev/null | sort -u | wc -l) 个 ==="
+            grep -oE '^time: package/[^#]+/compile' /tmp/make.log 2>/dev/null | sed 's|^time: ||; s|/compile$||' | sort -u
+            echo
+            echo "=== 关键包在日志中的出现次数 (0 = 本轮完全没被编译) ==="
+            for p in package/mtk/drivers/conninfra package/mtk/drivers/warp \
+                     package/mtk/drivers/mt_wifi package/mtk/applications; do
+              echo "$(grep -c "$p" /tmp/make.log 2>/dev/null || echo 0)  $p"
+            done
+          } > "$D/progress.txt" 2>&1
 
           # target/linux(内核) 失败: 兜底。V=s 日志已能覆盖大部分情况,
           # 只有提取不到任何内核错误时才花 50 分钟重编。
