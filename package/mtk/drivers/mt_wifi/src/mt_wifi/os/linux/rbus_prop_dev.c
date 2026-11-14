@@ -36,9 +36,22 @@ extern struct proc_dir_entry *proc_ptr, *proc_ralink_wl_video;
 #endif
 
 #ifdef MULTI_INTR_SUPPORT
-extern unsigned int multi_intr_2nd;
-extern unsigned int multi_intr_3rd;
-extern unsigned int multi_intr_4th;
+/*
+ * MT7981/MT7986 的 RBUS 模式会无条件打开 MULTI_INTR_SUPPORT
+ * (见 mt_wifi_ap/Makefile 中 CONFIG_7981_USE_PCI=n 的 else 分支),
+ * 但这份裁剪过的源码树里, 下面三个额外 IRQ 号全仓库只有 extern 声明、
+ * 没有任何定义, modpost 阶段必然报 undefined (run#28)。
+ *
+ * 原厂 SDK 由平台层传入 IRQ 号。这里补上默认 0 的定义, 等价于"未配置多 IRQ":
+ *   - probe 只在三者都 >0 时才写入 cfg, 而 cfg 本身已经 os_zero_mem 清零;
+ *   - CommonCfg.MultiIntr 由 profile 的 MultiIntr 键决定, 默认 0,
+ *     is_multi_intr=0 走单中断路径, 与原本的设计预期一致。
+ * 不直接关掉 MULTI_INTR_SUPPORT 是因为 mt7981.c 的 multi_isr 回调、
+ * ring 布局等正常中断处理代码也在这个宏下面。
+ */
+unsigned int multi_intr_2nd = 0;
+unsigned int multi_intr_3rd = 0;
+unsigned int multi_intr_4th = 0;
 #endif
 
 static struct pci_device_id mt_rbus_tbl[] DEVINITDATA = {
