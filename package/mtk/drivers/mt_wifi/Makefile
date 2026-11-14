@@ -330,8 +330,14 @@ endef
 
 Hooks/Prepare/Post := FIXUP_NEW_MCU_FW_API
 
+# -k 必须加在 kbuild 这一层, 不能指望外层 world 的 -k 传进来:
+# kbuild 的 scripts/Makefile.build 在第一个编译错误处就停, 实测 323 个
+# 目标文件只编出第一个 ap.o 就退出, 每轮构建(约 70 分钟)只能暴露一个问题。
+# 加了 -k 之后 kbuild 会继续编其余独立的 .o, 一轮就能拿到全部编译错误。
+# modules 目标本身仍会失败, 打包行为不受影响。
+# (注释放在 define 外面: 块内的 # 会被 make 展开成 recipe 行为)
 define Build/Compile
-	+$(MAKE) $(PKG_JOBS) -C "$(LINUX_DIR)" \
+	+$(MAKE) $(PKG_JOBS) -k -C "$(LINUX_DIR)" \
 		$(KERNEL_MAKE_FLAGS) \
 		M="$(PKG_BUILD_DIR)/mt_wifi_ap" \
 		LINUX_DIR="$(KERNEL_BUILD_DIR)" \

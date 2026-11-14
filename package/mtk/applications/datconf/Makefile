@@ -21,6 +21,15 @@ include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
 include $(INCLUDE_DIR)/kernel.mk
 
+# datconf 源码的 CMakeLists.txt 写的是 cmake_minimum_required(VERSION 2.6),
+# 而 OpenWrt 25.12 自带的 CMake 是 4.x —— 4.0 起彻底移除了对 < 3.5 的兼容,
+# 配置阶段直接报错:
+#   Compatibility with CMake < 3.5 has been removed from CMake.
+#      CMake Error at CMakeLists.txt:1 (cmake_minimum_required)
+# 用这个变量把最低版本下限抬到 3.5(CMake 4.0 起支持), 不改动上游源码,
+# 也就不影响 dl/ 里源码包的哈希。
+CMAKE_OPTIONS += -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
 define Package/libkvcutil
   SECTION:=libs
   CATEGORY:=Libraries

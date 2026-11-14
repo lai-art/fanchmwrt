@@ -2,6 +2,17 @@
 /* Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.*/
 
 #include <linux/module.h>
+
+#include <linux/version.h>
+/*
+ * ---- Linux 5.19+/6.12 兼容层 ----
+ * strlcpy() 在 5.19 被移出内核(strscpy() 取代)。本文件所有调用都不使用
+ * 返回值, 且目标缓冲区都是定长成员(if_name / driver / version),
+ * 语义等价, 直接映射即可。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+#define strlcpy(dst, src, size)			strscpy(dst, src, size)
+#endif
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>

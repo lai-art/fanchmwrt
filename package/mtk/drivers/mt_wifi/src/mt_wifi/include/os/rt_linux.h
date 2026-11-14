@@ -55,7 +55,17 @@
 #include <linux/unistd.h>
 #include <asm/uaccess.h>
 #include <asm/types.h>
+/*
+ * asm/unaligned.h 在 6.12 被移除: include/asm-generic/unaligned.h 改名为
+ * include/linux/unaligned.h (arm64 一直靠 generic-y 从 asm-generic 生成
+ * asm/unaligned.h, 源文件没了也就没有这个头了)。get_unaligned()/put_unaligned()
+ * 在新位置仍然可用。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#include <linux/unaligned.h>	/* for get_unaligned() */
+#else
 #include <asm/unaligned.h>	/* for get_unaligned() */
+#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 27)
 #include <linux/pid.h>
