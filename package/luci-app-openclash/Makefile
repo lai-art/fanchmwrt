@@ -61,8 +61,13 @@ define Build/Prepare
 	$(CP) $(CURDIR)/luasrc $(PKG_BUILD_DIR)
 	# Replace the @OPENCLASH_VERSION@ token with the package version (browser asset cache keys).
 	sed -i 's|@OPENCLASH_VERSION@|$(PKG_VERSION)|g' $(PKG_BUILD_DIR)/luasrc/openclash.lua $(PKG_BUILD_DIR)/luasrc/view/openclash/*.htm
+	# po2lmo: 25.12 主树的 tools/ 已不带这个 LuCI 翻译编译工具，只能就地用宿主 CC 编。
+	# 不写成裸 "po2lmo" 依赖 PATH —— 那样 CI 环境一变就报 command not found，
+	# 而且 make 的报错只会显示 "po2lmo ... : not found"，看不出是缺 host 工具。
+	$(MAKE) -C $(CURDIR)/tools/po2lmo clean >/dev/null 2>&1 || true
+	$(MAKE) -C $(CURDIR)/tools/po2lmo CC="$(HOSTCC)" CFLAGS="$(HOST_CFLAGS)"
 	$(foreach po,$(wildcard ${CURDIR}/po/zh-cn/*.po), \
-		po2lmo $(po) $(PKG_BUILD_DIR)/$(patsubst %.po,%.lmo,$(notdir $(po)));)
+		$(CURDIR)/tools/po2lmo/src/po2lmo $(po) $(PKG_BUILD_DIR)/$(patsubst %.po,%.lmo,$(notdir $(po)));)
 	# 权限：仓库在 Windows 上维护，git 的 fileMode 不生效，脚本的 +x 位会丢。
 	# 不在这里补，打进固件后 /etc/init.d/openclash 不可执行，OpenClash 根本起不来。
 	chmod 0755 $(PKG_BUILD_DIR)/root/etc/init.d/openclash
