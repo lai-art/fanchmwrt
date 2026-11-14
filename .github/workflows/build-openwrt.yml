@@ -115,6 +115,85 @@ jobs:
       - name: 安装 feeds
         run: ./scripts/feeds install -a
 
+      - name: 预置 OpenClash 运行环境（po2lmo + mihomo 内核）
+        run: |
+          set -u
+          OC_DIR=package/luci-app-openclash
+          if [ ! -d "$OC_DIR" ]; then
+            echo "::warning::未找到 $OC_DIR，跳过 OpenClash 预置"
+            exit 0
+          fi
+
+          # ---- 1) po2lmo: 25.12 主树已不带这个 LuCI 翻译编译工具 ----
+          # OpenClash 的 Makefile 在 Build/Prepare 里直接调用 po2lmo，
+          # 而 buildroot 的 tools/ 里没有它（已被 luci 移到别处），
+          # 所以用包内自带的 C 源码在宿主上编一份装进 PATH。
+          if ! command -v po2lmo >/dev/null 2>&1; then
+            make -C "$OC_DIR/tools/po2lmo" clean >/dev/null 2>&1 || true
+            # 注意不能写成 "if make ... | tail"：管道退出码取的是 tail，永远 0。
+            if make -C "$OC_DIR/tools/po2lmo" > /tmp/po2lmo_build.log 2>&1; then
+              tail -3 /tmp/po2lmo_build.log
+              sudo install -m 755 "$OC_DIR/tools/po2lmo/src/po2lmo" /usr/local/bin/po2lmo
+            else
+              tail -20 /tmp/po2lmo_build.log
+              echo "::error::po2lmo 编译失败 —— OpenClash 的 i18n 步骤会失败"
+              exit 1
+            fi
+          fi
+          echo "po2lmo: $(command -v po2lmo)"
+
+          # ---- 2) mihomo 内核预置 ----
+          # OpenClash 只是个壳，没有 clash/mihomo 内核跑不起来。默认流程是
+          # 用户进 LuCI 点「内核更新」从 GitHub 下（大陆基本下不动）。
+          # 这里直接把 arm64 内核打进 /etc/openclash/core/clash_meta，开箱可用；
+          # 用户后续仍可在界面里一键更新到新版。
+          CORE_DIR="$OC_DIR/root/etc/openclash/core"
+          mkdir -p "$CORE_DIR"
+          if [ -s "$CORE_DIR/clash_meta" ]; then
+            echo "内核已存在，跳过下载: $(ls -lh "$CORE_DIR/clash_meta" | awk '{print $5}')"
+          else
+            TAG=$(curl -fsSL --retry 3 --connect-timeout 15 \
+                  "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" \
+                  | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"])' 2>/dev/null || echo "")
+            [ -n "$TAG" ] || TAG=$(curl -fsSL --retry 2 --connect-timeout 15 \
+                  "https://ghfast.top/https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" \
+                  | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"])' 2>/dev/null || echo "")
+            # API 被限流时退回一个已知可用版本，别为一枚 API 调用丢掉整个内核
+            [ -n "$TAG" ] || TAG="v1.19.34"
+            echo "mihomo 内核版本: ${TAG}"
+
+            ok=0
+            if [ -n "$TAG" ]; then
+              FNAME="mihomo-linux-arm64-${TAG}.gz"
+              for base in \
+                "https://github.com/MetaCubeX/mihomo/releases/download/${TAG}" \
+                "https://ghfast.top/https://github.com/MetaCubeX/mihomo/releases/download/${TAG}" \
+                "https://gh-proxy.com/https://github.com/MetaCubeX/mihomo/releases/download/${TAG}" \
+                "https://ghproxy.net/https://github.com/MetaCubeX/mihomo/releases/download/${TAG}"; do
+                echo "尝试下载: ${base}/${FNAME}"
+                if curl -fsSL --retry 2 --connect-timeout 20 -o /tmp/clash_meta.gz "${base}/${FNAME}"; then
+                  if gzip -t /tmp/clash_meta.gz 2>/dev/null; then
+                    gzip -dc /tmp/clash_meta.gz > "$CORE_DIR/clash_meta"
+                    chmod 755 "$CORE_DIR/clash_meta"
+                    ok=1; break
+                  else
+                    echo "  压缩包损坏，换下一个源"
+                  fi
+                fi
+              done
+            fi
+
+            if [ "$ok" -eq 1 ]; then
+              echo "=== 内核就位 ==="
+              ls -lh "$CORE_DIR/clash_meta"
+              file "$CORE_DIR/clash_meta" || true
+            else
+              # 不阻断构建：固件照样出，内核可后续在 LuCI 里更新/上传
+              echo "::warning::mihomo 内核下载失败，固件将不含内核（可在 LuCI → OpenClash → 内核更新 里补装）"
+              echo "mihomo core: DOWNLOAD_FAILED" > openclash-core-status.txt
+            fi
+          fi
+
       - name: 应用设备配置
         run: |
           if [ ! -f "configs/${DEVICE_CONFIG}" ]; then
@@ -140,7 +219,8 @@ jobs:
             CONFIG_PACKAGE_luci-theme-argon \
             CONFIG_PACKAGE_luci-theme-aurora \
             CONFIG_PACKAGE_luci-app-mwrt-catcage \
-            CONFIG_PACKAGE_luci-app-Airpifanctrl ; do
+            CONFIG_PACKAGE_luci-app-Airpifanctrl \
+            CONFIG_PACKAGE_luci-app-openclash ; do
             if grep -qx "${c}=y" .config; then
               log "  OK   $c"
             else
@@ -451,6 +531,7 @@ jobs:
           fi
           echo "=== 产物清单 ==="
           cp -v wanted-report.txt artifacts/ 2>/dev/null || true
+          cp -v openclash-core-status.txt artifacts/ 2>/dev/null || true
           ls -lh artifacts/ || true
 
       - name: 上传固件
