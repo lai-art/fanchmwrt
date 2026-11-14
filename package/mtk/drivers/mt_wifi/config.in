@@ -558,17 +558,23 @@ config MTK_RTMP_FLASH_SUPPORT
 config MTK_PRE_CAL_TRX_SET1_SUPPORT
 	bool "Calibration To Flash/BinFile Support"
 	depends on MTK_WIFI_DRIVER
-	default y
+	# MT7981: 该分支依赖的 PRE_CAL_*/DPD_*/K_* 常量头文件未随源码提供,
+	# 且分支内自带语法错误(mt_cmd.c 回调 pAd 未声明、ret)); 多一个括号)。
+	# 上游从未在 MT7981 编过这段代码, 保持关闭(run#27 的 43 处错误)。
+	default n
 
 config MTK_RLM_CAL_CACHE_SUPPORT
 	bool "RlmCalibrationCache Support"
 	depends on MTK_WIFI_DRIVER
-	default y
+	# 与 PRE_CAL_TRX_SET2_SUPPORT 共用 andes_mt.c 的 precal 事件块,
+	# 该块引用未定义的 PRECALPART_OFFSET。MT7981 上一起关闭。
+	default n
 
 config MTK_PRE_CAL_TRX_SET2_SUPPORT
 	bool "Pre-calibration to Flash Support"
 	depends on MTK_WIFI_DRIVER
-	default y
+	# 同 MTK_PRE_CAL_TRX_SET1_SUPPORT: MT7981 平台不可用。
+	default n
 
 config MTK_CAL_BIN_FILE_SUPPORT
 	bool "Calibration to BinFile Support"

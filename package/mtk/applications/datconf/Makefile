@@ -28,7 +28,9 @@ include $(INCLUDE_DIR)/kernel.mk
 #      CMake Error at CMakeLists.txt:1 (cmake_minimum_required)
 # 用这个变量把最低版本下限抬到 3.5(CMake 4.0 起支持), 不改动上游源码,
 # 也就不影响 dl/ 里源码包的哈希。
-CMAKE_OPTIONS += -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+# 注意: 必须放进下面唯一的 CMAKE_OPTIONS = 赋值里。
+# run#27 教训: 写在这里的 += 会被文件后面那句 `CMAKE_OPTIONS = ...` 整个覆盖,
+# 命令行里只剩 -DLUAPATH, 策略参数根本没传进去。
 
 define Package/libkvcutil
   SECTION:=libs
@@ -63,7 +65,8 @@ TARGET_CFLAGS += -I$(STAGING_DIR)/usr/include
 TARGET_LDFLAGS += -L$(STAGING_DIR)/usr/lib
 
 CMAKE_OPTIONS = \
-        -DLUAPATH=/usr/lib/lua
+        -DLUAPATH=/usr/lib/lua \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
 
 define Package/libkvcutil/install
