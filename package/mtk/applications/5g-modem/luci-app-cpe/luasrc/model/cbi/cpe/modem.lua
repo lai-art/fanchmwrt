@@ -138,7 +138,7 @@ an.rmempty=false
 local apply = luci.http.formvalue("cbi.apply")
 if apply then
     -- io.popen("/etc/init.d/modeminit restart")
-	io.popen("/etc/init.d/modem restart")
+	io.popen("/etc/init.d/cpemodem restart")
 end
 
 return m,m2

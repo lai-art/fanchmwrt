@@ -176,9 +176,9 @@ modem_reset()
     }
 	else
 	{
-        start="$( /etc/init.d/modem stop )"
+        start="$( /etc/init.d/cpemodem stop )"
         sleep 2s
-        start="$( /etc/init.d/modem start )"
+        start="$( /etc/init.d/cpemodem start )"
         sleep 5s
     }
 	fi
@@ -188,7 +188,7 @@ check_sim()
 {
 	while [ 1 ]
 	do
-        enabled=$(uci -q get modem.@ndis[0].enabled)
+        enabled=$(uci -q get cpemodem.@ndis[0].enabled)
         if [ $enabled == '1' ] ;then
             echo "Check the sim"
             rec=$( sendat 2 "AT+CPIN?")
@@ -213,12 +213,12 @@ chenk_firstdns()
 {
     while [ 1 ]
     do
-        enabled=$(uci -q get modem.@ndis[0].enabled)
-        en1=$(uci -q get modem.@ndis[0].en)
+        enabled=$(uci -q get cpemodem.@ndis[0].enabled)
+        en1=$(uci -q get cpemodem.@ndis[0].en)
         if [ $enabled == '1' ] ;then
             if [ $en1 == '1' ] ;then
                 echo "------------------------------开启任务---------------------------"
-                ipadd=$(uci -q get modem.@ndis[0].ipaddress)
+                ipadd=$(uci -q get cpemodem.@ndis[0].ipaddress)
                 ping -c 1 -w 1  $ipadd > /dev/null 2>&1
                 if [ $? -eq 0 ];then  
                     echo "网络连接正常" 
@@ -247,10 +247,10 @@ chenk_firstdns()
 #检测网络状态
 chenk_dns()
 {
-    en1=$(uci -q get modem.@ndis[0].en)
+    en1=$(uci -q get cpemodem.@ndis[0].en)
     if [ $en1 == '1' ] ;then
         echo "------------------------------开启任务---------------------------"
-        ipadd=$(uci -q get modem.@ndis[0].ipaddress)
+        ipadd=$(uci -q get cpemodem.@ndis[0].ipaddress)
         ping -c 1 -w 1  $ipadd > /dev/null 2>&1
         if [ $? -eq 0 ];then  
             echo "网络连接正常" 
@@ -260,7 +260,7 @@ chenk_dns()
             let xx++
         fi	
     fi
-    an=$(uci -q get modem.@ndis[0].an)
+    an=$(uci -q get cpemodem.@ndis[0].an)
     if [ $xx == $an ];then
         xx=0
         modem_reset
@@ -273,7 +273,7 @@ chenk_Task()
 {
     while [ 1 ]
     do
-        enabled=$(uci -q get modem.@ndis[0].enabled)
+        enabled=$(uci -q get cpemodem.@ndis[0].enabled)
         if [ $enabled == '1' ] ;then
             ATPORT
             Debug "------------------------------开启任务---------------------------"

@@ -15,7 +15,7 @@ Debug()
 ATPORT()
 {
 	MODEMNAME="ALL"
-	# ATPORT=$(uci -q get modem.@ndis[0].tyyusb)
+	# ATPORT=$(uci -q get cpemodem.@ndis[0].tyyusb)
 	lsusb=$( lsusb )
 	RDFM650=$(echo "$lsusb" | grep "ID 2cb7:0a05 " | wc -l)
 	if [ "$RDFM650" == 1 ]; then

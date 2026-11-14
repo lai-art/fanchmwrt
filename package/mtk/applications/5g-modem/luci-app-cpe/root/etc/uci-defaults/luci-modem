@@ -3,7 +3,7 @@
 uci -q batch <<-EOF >/dev/null
 	delete ucitrack.@modem[-1]
 	add ucitrack modem
-	set ucitrack.@modem[-1].init=modem
+	set ucitrack.@modem[-1].init=cpemodem
 	commit ucitrack
 EOF
 

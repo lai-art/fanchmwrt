@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=MediaTek Proprietary Configuration.
-LUCI_DEPENDS:=+datconf-lua
+LUCI_DEPENDS:=+datconf-lua +mtwifi-cfg
 LUCI_PKGARCH:=all
 
 include $(TOPDIR)/feeds/luci/luci.mk

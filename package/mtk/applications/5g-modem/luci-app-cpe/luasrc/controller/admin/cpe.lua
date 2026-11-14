@@ -13,7 +13,7 @@ function index()
 	-- entry({"admin", "modem", "band"}, template("cpe/band"), translate("锁频段/锁PCI"), 1)
 	entry({"admin", "modem", "at"}, template("cpe/at"), translate("AT工具"), 98)
 	
-	if not nixio.fs.access("/etc/config/modem") then
+	if not nixio.fs.access("/etc/config/cpemodem") then
 		return
 	end
 	entry({"admin", "modem", "modem"}, cbi("cpe/modem"), _("模块设置"), 99) 
