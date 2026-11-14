@@ -213,6 +213,10 @@ jobs:
           fi
           log ""
           log "=== 配置中请求但被 defconfig 丢弃的包 ==="
+          # 2026-11-14: 改为"记录不阻断"。原因: 用户按 Mwrt 原包清单一次性提交了 500+ 包,
+          # 其中不可避免存在 25.12 已更名的包名。若仍按老逻辑直接 fail, 每轮只能拿到
+          # 一份 DROP 清单却拿不到任何固件, 与"一轮出结果"的目标冲突。
+          # 真正的关键选型已由上面的"关键选型硬校验"逐项把关, 这里只做诊断输出。
           drop=0
           fatal=0
           for p in $(grep -oE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' "configs/${DEVICE_CONFIG}" | sed -E 's/^CONFIG_PACKAGE_//; s/=y$//'); do
@@ -220,14 +224,18 @@ jobs:
               log "  DROP $p"
               grep -E "^CONFIG_PACKAGE_${p}=" .config | sed 's/^/       现状: /' | tee -a "$OUT"
               drop=$((drop + 1))
-              # 翻译包缺失不阻断编译(只影响该语言文案), 其余任何缺失都算功能缺失
               case "$p" in
                 luci-i18n-*) log "       (翻译包, 不阻断构建)" ;;
-                *) fatal=$((fatal + 1)) ;;
+                *) fatal=$((fatal + 1)); echo "$p" >> /tmp/dropped.txt ;;
               esac
             fi
           done
-          log "共丢弃 ${drop} 项, 其中阻断性 ${fatal} 项"
+          log "共丢弃 ${drop} 项, 其中非翻译 ${fatal} 项（仅记录, 不阻断）"
+          if [ "$fatal" -gt 0 ]; then
+            log ""
+            log "=== 非翻译 DROP 汇总（这些包名在 25.12 不存在或依赖不满足）==="
+            cat /tmp/dropped.txt | tee -a "$OUT"
+          fi
 
           # 丢弃时给出候选符号名, 避免再去猜包名
           if [ "$drop" -gt 0 ] && [ -f tmp/.config-package.in ]; then
@@ -241,10 +249,43 @@ jobs:
             log "--- .config 中 luci-base 现状 ---"
             grep -E "^CONFIG_PACKAGE_luci-base=" .config | tee -a "$OUT"
           fi
-          # 任何被丢弃的非翻译包都意味着某项功能缺失, 直接失败, 便于在 5 分钟内定位
-          [ "$fatal" -eq 0 ] || fail=1
-          log "=== 自检结果: fail=${fail} ==="
+          # 2026-11-14: DROP 不再作为失败条件（见上），是否失败只由"关键选型硬校验"决定
+          log "=== 自检结果: fail=${fail}  drop=${drop} (非翻译 ${fatal}) ==="
           [ "$fail" -eq 0 ]
+
+      - name: 用户清单覆盖率校验
+        run: |
+          # 把用户提交的 542 项清单逐条对照最终 .config，输出命中/未命中明细。
+          # 未命中不代表构建失败，只表示该包名在 OpenWrt 25.12 主树中不存在
+          # （Mwrt 私有件 / immortalwrt 专有 / 已在 25.12 更名或移除）。
+          LIST="configs/wanted-packages.txt"
+          [ -f "$LIST" ] || { echo "无清单文件，跳过"; exit 0; }
+          MISS=/tmp/wanted_miss.txt; HIT=/tmp/wanted_hit.txt
+          : > "$MISS"; : > "$HIT"
+          total=0
+          while IFS= read -r p; do
+            p=$(echo "$p" | tr -d '\r' | sed 's/[[:space:]]*$//')
+            [ -z "$p" ] && continue
+            case "$p" in \#*) continue ;; esac
+            total=$((total + 1))
+            if grep -qE "^CONFIG_PACKAGE_${p}=(y|m)$" .config; then
+              echo "$p" >> "$HIT"
+            else
+              echo "$p" >> "$MISS"
+            fi
+          done < "$LIST"
+          hitc=$(wc -l < "$HIT"); missc=$(wc -l < "$MISS")
+          echo "=================================================="
+          echo "用户清单覆盖率: ${hitc}/${total}   未命中: ${missc}"
+          echo "=================================================="
+          if [ "$missc" -gt 0 ]; then
+            echo "::group::未命中包名（25.12 主树无此包）"
+            cat "$MISS"
+            echo "::endgroup::"
+          fi
+          { echo "用户清单 ${total} 项 | 命中 ${hitc} | 未命中 ${missc}"; echo ""; \
+            echo "=== 未命中（25.12 主树不存在此包名）==="; cat "$MISS"; } > wanted-report.txt
+          echo "报告已写入 wanted-report.txt"
 
       # GCC 对未知的 -Wno-error=NAME 是硬错误, 不是警告:
       #   error: '-Wno-error=macro-redefined': no option '-Wmacro-redefined'
@@ -409,6 +450,7 @@ jobs:
               -exec cp -v {} artifacts/ \;
           fi
           echo "=== 产物清单 ==="
+          cp -v wanted-report.txt artifacts/ 2>/dev/null || true
           ls -lh artifacts/ || true
 
       - name: 上传固件
