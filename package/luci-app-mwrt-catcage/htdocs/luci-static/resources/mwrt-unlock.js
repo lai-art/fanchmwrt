@@ -287,9 +287,12 @@
 		} catch (e) {}
 	}
 
-	/* s90: 公开接口。侧栏笼中猫(mwrt-catcage.js)破笼后调用 open() 弹出同一个认证框。 */
+	/* s90: 公开接口。侧栏笼中猫(mwrt-catcage.js)破笼后调用 open() 弹出同一个认证框。
+	 * 新增 auto()：破笼后直接本地解锁，不弹框、不联网（后端 action_Outofnetwork
+	 * 已是纯本地写标志，见 luasrc/controller/mwrt_catcage.lua）。 */
 	window.MwrtUnlock = {
 		open: function () { show(); },
+		auto: function () { unlockNow(); },
 		isOpen: function () { return !!overlay && overlay.style.display === 'flex'; }
 	};
 
@@ -322,6 +325,27 @@
 		if (!CATHIDE) { try { sessionStorage.setItem('mwrt-cat-celebrate', '1'); } catch (e) {} }
 		fire('mwrt-unlock-ok', { ok: true });
 		setTimeout(function () { location.reload(); }, 1200);
+	}
+
+	/* 破笼后代替用户静默提交一次，成功后复用 succeed() 的星光/礼花动效并刷新菜单。
+	 * token 来源与 send() 完全一致；仅当后端非 'yes' 或网络异常时才回落到认证框。 */
+	function unlockNow() {
+		if (done) return;
+		if (!overlay) build();
+		var token = (window.L && L.env && L.env.token) || '';
+		var body = 'token=' + encodeURIComponent(token) + '&set=' + encodeURIComponent('unlock');
+		var xhr = new XMLHttpRequest();
+		xhr.open('POST', URL_, true);
+		xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+		xhr.timeout = 20000;
+		xhr.onload = function () {
+			var res = null;
+			try { res = JSON.parse(xhr.responseText).resdd; } catch (e) {}
+			if (res === 'yes') return succeed();
+			show();
+		};
+		xhr.onerror = xhr.ontimeout = function () { show(); };
+		xhr.send(body);
 	}
 
 	function send() {
@@ -411,7 +435,8 @@
 		if (catN >= NEED) {
 			catEscape();
 			var n = catN; catN = 0;
-			setTimeout(show, 760);           /* 等跳出动画播完再弹框 */
+			/* 破笼后直接本地解锁（不再弹授权框），等跳出动画播完再提交 */
+			setTimeout(unlockNow, 760);
 			setTimeout(catReset, 1400);
 		}
 	}

@@ -956,6 +956,9 @@
 		if (G.st !== 'freed') return;
 		G.st = 'dialog';
 		var U = window.MwrtUnlock, ok = false;
+		/* 破笼后直接本地解锁，不弹授权框。auto() 成功会派发 mwrt-unlock-ok
+		 * 走 onUnlockOk 的成功动效；auto 不存在或异常时才回落到 open()。 */
+		try { if (U && typeof U.auto === 'function') { U.auto(); return; } } catch (e) {}
 		try { if (U && typeof U.open === 'function') { U.open(); ok = true; } } catch (e) { ok = false; }
 		if (!ok) {
 			/* 认证框还没就绪(脚本顺序/加载失败): 等一等再试, 实在不行就当取消处理, 让猫复位 */
