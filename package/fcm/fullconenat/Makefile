@@ -60,10 +60,14 @@ define Build/Prepare
 endef
 
 define Build/Compile
-	+$(MAKE) $(PKG_JOBS) -C "$(LINUX_DIR)" \
-        CROSS_COMPILE="$(TARGET_CROSS)" \
-        ARCH="$(LINUX_KARCH)" \
-        SUBDIRS="$(PKG_BUILD_DIR)" \
+	# grep 兜底：确认 Kbuild 文件真的落在 PKG_BUILD_DIR 根目录
+	grep -q '^obj-m += xt_FULLCONENAT.o' $(PKG_BUILD_DIR)/Makefile
+	# SUBDIRS= 早在 5.x 就被 kbuild 废弃，Linux 6.12 的顶层 Makefile 里已经彻底没有这个变量
+	# （grep SUBDIRS 命中 0 次），只剩 M= / KBUILD_EXTMOD。
+	# 老写法下 make ... SUBDIRS=... modules 会退化成"编译树内模块"，什么都不编也不报错，
+	# 最后在打包阶段才炸：ERROR: module '.../xt_FULLCONENAT.ko' is missing.
+	+$(KERNEL_MAKE) $(PKG_JOBS) \
+        M="$(PKG_BUILD_DIR)" \
         EXTRA_CFLAGS="$(BUILDFLAGS)" \
         modules
 	$(call Build/Compile/Default)
