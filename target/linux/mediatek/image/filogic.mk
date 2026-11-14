@@ -1256,13 +1256,18 @@ define Device/cudy_re3000-v1
 endef
 TARGET_DEVICES += cudy_re3000-v1
 
+# 注意 SUPPORTED_DEVICES：默认项由 profile 名生成 cudy_tr3000-256mb-v1 → cudy,tr3000-256mb-v1，
+# 但机器上现装的 Mwrt(24.10) 固件把 compatible 写成了 cudy,tr3000-v1-256mb（词序不同），
+# /tmp/sysinfo/board_name 因此报后者。不把旧名字加进白名单，LuCI 里升级会被 sysupgrade 拒:
+#   Device cudy,tr3000-v1-256mb not supported by this image
+# 同一块硬件，只是命名顺序不同，白名单里两个都放行。
 define Device/cudy_tr3000-256mb-v1
   DEVICE_VENDOR := Cudy
   DEVICE_MODEL := TR3000
   DEVICE_VARIANT := 256mb v1
   DEVICE_DTS := mt7981b-cudy-tr3000-256mb-v1
   DEVICE_DTS_DIR := ../dts
-  SUPPORTED_DEVICES += R103
+  SUPPORTED_DEVICES += R103 cudy,tr3000-v1-256mb
   UBINIZE_OPTS := -E 5
   BLOCKSIZE := 128k
   PAGESIZE := 2048
