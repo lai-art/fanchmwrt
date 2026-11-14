@@ -1,0 +1,5 @@
+run_number=34
+run_id=43605671056
+sha=fb9054a81cf72f9e395c3ea8bb6e550f1b7f81b3
+ref=fanchmwrt-25.12.6
+time=2026-11-14T17:40:02Z
