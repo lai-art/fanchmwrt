@@ -1273,6 +1273,10 @@ define Device/cudy_tr3000-256mb-v1
   PAGESIZE := 2048
   IMAGE_SIZE := 235520k
   KERNEL_IN_UBI := 1
+  # 同时产出 UBI 工厂镜像（factory.bin）。Cudy U-Boot 恢复页的“固件升级”
+  # 只接受裸 UBI 镜像，会拒绝 sysupgrade-tar；加 factory.bin 后即可在该页面直刷。
+  IMAGES += factory.bin
+  IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
   DEVICE_PACKAGES := kmod-usb3 mt7981-wo-firmware kmod-mt_wifi
 endef
