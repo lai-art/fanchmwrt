@@ -1,0 +1,295 @@
+#!/bin/sh
+# mwrt-phone-ctl: 5700 模组拨号/接听/挂断(s101)
+#
+# 全系统【唯一】构造写入类 AT(ATD/ATA/ATH/AT+CHUP)的地方。LuCI 只把已校验的参数交给它,
+# 守护 mwrt-phoned 只读不写。所有 AT 一律经 sendat(带 flock),不自己开串口。
+#
+# 用法: mwrt-phone-ctl dial <号码> | answer | hangup | which | present
+# (s103: dial 在 state.json 显示 ims=0 时会先做一次只读 AT^IMSSWITCH? 实时复核,见 cmd_dial)
+# 输出: 一行 JSON。成功 {"ok":true,"state":"..","via":"real|override"}
+#       失败 {"ok":false,"http":<状态码>,"err":"<码>","msg":"<中文>"}   (LuCI 按 http 字段回状态码)
+# which 只输出实际使用的 sendat 路径; present 输出 present/absent,退出码 0/1。
+#
+# sendat 解析顺序: 环境变量 MWRT_PHONE_SENDAT → /tmp/mwrt-phone/sendat.override(仅测试钩子,
+# 内容必须是 /tmp/ 开头的可执行文件) → /usr/bin/sendat。
+
+D="${MWRT_PHONE_DIR:-/tmp/mwrt-phone}"
+MODCONF="${MWRT_PHONE_MODCONF:-/tmp/modconf.conf}"
+USBDIR="${MWRT_PHONE_USBDIR:-/sys/bus/usb/devices}"
+UCI_ARGS="${MWRT_PHONE_UCI_ARGS:-}"
+
+resolve_sendat() {
+	VIA=real
+	SENDAT=/usr/bin/sendat
+	if [ -n "$MWRT_PHONE_SENDAT" ]; then
+		SENDAT="$MWRT_PHONE_SENDAT"
+		VIA=override
+		return
+	fi
+	if [ -f "$D/sendat.override" ]; then
+		_ov=$(head -n 1 "$D/sendat.override" 2>/dev/null | tr -d '\r ')
+		case "$_ov" in
+			/tmp/*)
+				case "$_ov" in
+					*[!A-Za-z0-9._/-]*) ;;
+					*) if [ -x "$_ov" ]; then SENDAT="$_ov"; VIA=override; fi ;;
+				esac
+				;;
+		esac
+	fi
+}
+
+# 在场判据(与 footer.ut、daemon、modem.lua 同一套): modconf 含 5700 且 sysfs 有 idVendor=3466
+is_present() {
+	[ -r "$MODCONF" ] || return 1
+	head -c 128 "$MODCONF" 2>/dev/null | tr 'A-Z' 'a-z' | grep -q 5700 || return 1
+	for _d in "$USBDIR"/*; do
+		[ -r "$_d/idVendor" ] || continue
+		[ "$(head -c 16 "$_d/idVendor" 2>/dev/null | tr -d ' \r\n')" = "3466" ] && return 0
+	done
+	return 1
+}
+
+die() { # http err msg
+	printf '{"ok":false,"http":%s,"err":"%s","msg":"%s"}\n' "$1" "$2" "$3"
+	exit 0
+}
+
+uptime_int() {
+	read _up _ < /proc/uptime
+	echo "${_up%.*}"
+}
+
+now_nap() { # 0.6 秒; busybox sleep 不支持小数
+	lua -e 'require("nixio").nanosleep(0, 600000000)' 2>/dev/null || sleep 1
+}
+
+# 紧急号码与常见短号: 本身,或去掉 + 与 1~3 位国家码后的同号
+EMERG="110 112 119 120 122 911 999 000"
+is_emergency() {
+	_d="${1#+}"
+	# s101sec: 国际冠字 00 开头(0086110 等同 +86110)也要判一遍
+	_d2="$_d"
+	case "$_d" in 00?*) _d2="${_d#00}" ;; esac
+	for _x in "$_d" "$_d2"; do
+		for _e in $EMERG; do
+			[ "$_x" = "$_e" ] && return 0
+			_l=${#_x}; _el=${#_e}
+			_extra=$((_l - _el))
+			if [ "$_extra" -ge 1 ] && [ "$_extra" -le 3 ]; then
+				case "$_x" in
+					*"$_e") return 0 ;;
+				esac
+			fi
+		done
+	done
+	return 1
+}
+
+# 不用 grep(它按行匹配,号码里夹带换行时首行就能通过): 用 case 逐字符判,换行等一律拒绝
+valid_number() {
+	_v="$1"
+	case "$_v" in +*) _v="${_v#+}" ;; esac
+	case "$_v" in ''|*[!0-9]*) return 1 ;; esac
+	[ "${#_v}" -ge 3 ] && [ "${#_v}" -le 20 ]
+}
+
+state_get() { # 读 state.json 的若干字段到 ST_SUP ST_TS ST_IMS ST_CALL
+	ST_SUP=""; ST_TS=0; ST_IMS=-1; ST_CALL=""; ST_HEALTH=""
+	[ -r "$D/state.json" ] || return 1
+	_o=$(jsonfilter -i "$D/state.json" -e '@.supported' -e '@.ts' -e '@.ims' -e '@.call.state' -e '@.health' 2>/dev/null) || return 1
+	ST_SUP=$(printf '%s\n' "$_o" | sed -n 1p)
+	ST_TS=$(printf '%s\n' "$_o" | sed -n 2p)
+	ST_IMS=$(printf '%s\n' "$_o" | sed -n 3p)
+	ST_CALL=$(printf '%s\n' "$_o" | sed -n 4p)
+	ST_HEALTH=$(printf '%s\n' "$_o" | sed -n 5p)
+	return 0
+}
+
+precheck() {
+	is_present || die 503 not5700 "未检测到 5700 模组"
+	_en=$(uci $UCI_ARGS -q get 'mwrt.@ndis[0].phoneen' 2>/dev/null)
+	[ "$_en" = "0" ] && die 503 disabled "通话功能已关闭"
+	state_get || die 503 daemon_down "通话守护进程未运行"
+	[ "$ST_SUP" = "true" ] || die 503 not5700 "未检测到 5700 模组"
+	_now=$(date +%s)
+	case "$ST_TS" in ''|*[!0-9]*) ST_TS=0 ;; esac
+	[ $((_now - ST_TS)) -gt 20 ] && die 503 daemon_down "通话守护进程无响应"
+	return 0
+}
+
+take_lock() {
+	mkdir -p "$D" 2>/dev/null
+	exec 9>"$D/ctl.lock"
+	flock -n 9 || die 409 busy "上一个通话操作还在进行,请稍后"
+}
+
+write_hint() { # 追加一行
+	printf '%s\n' "$1" >> "$D/hint"
+}
+
+err_code() { # 从回包取 CME/CMS 错误码(只留数字)
+	printf '%s' "$1" | tr -d '\r' | grep -o 'ERROR: *[0-9]*' | head -n 1 | grep -o '[0-9]*'
+}
+
+log() { logger -t mwrt-phone "$1" 2>/dev/null; }
+
+# s103: 实时只读查询 IMS 开关,输出 0 / 1 / unk。须先 resolve_sendat。
+# 与守护 parse_ims 同一规则: 必须有 OK 且有 ^IMSSWITCH: <n>; n==1 -> 1,其余数字 -> 0,其余一律 unk。
+# 外层 timeout 12 秒 > sendat 自己的 8 秒等锁 + 2 秒读回包。只发 AT^IMSSWITCH?(查询),不带 =。
+ims_live() {
+	_r=$(timeout 12 "$SENDAT" 1 "AT^IMSSWITCH?" 2 2>/dev/null | tr -d '\r')
+	case "$_r" in *OK*) ;; *) echo unk; return ;; esac
+	_v=$(printf '%s\n' "$_r" | sed -n 's/^\^IMSSWITCH:[[:space:]]*\(-\{0,1\}[0-9][0-9]*\).*/\1/p' | head -n 1)
+	case "$_v" in
+		'') echo unk ;;
+		1) echo 1 ;;
+		*) echo 0 ;;
+	esac
+}
+
+cmd_dial() {
+	_n="$1"
+	valid_number "$_n" || die 400 bad_number "号码格式不正确(仅支持 3~20 位数字,可带开头的 +)"
+	is_emergency "$_n" && die 400 emergency_blocked "不支持拨打紧急号码或短号"
+	precheck
+	take_lock
+	# precheck 之后重新读一次状态(拿到锁才算数)
+	state_get
+	case "$ST_CALL" in
+		idle|ended) ;;
+		*) die 409 busy "当前已有通话,请先挂断" ;;
+	esac
+	# s101rel: 守护在开机 180 秒内(booting)或切卡中(busy)不轮询 CLCC,此时拨出的电话没人观察,
+	# 接通后界面看不到也挂不掉。这两种状态不放行拨号。
+	case "$ST_HEALTH" in
+		booting) die 503 not_ready "模组刚启动,通话功能还在准备中,请稍后再试" ;;
+		busy) die 503 not_ready "模组正在切卡或重置,请稍后再试" ;;
+	esac
+	# s103: state.json 的 ims=0 可能是旧的(守护 30~300 秒才复查一次,用户刚在设置页打开后还没刷新),
+	# 所以不直接信它,先经 sendat 做一次【只读】AT^IMSSWITCH? 实时确认(解析规则与守护 parse_ims 相同)。
+	#   实时仍为 0   -> 409 ims_off
+	#   实时读到 1   -> 放行,并经 hint 通知守护把 state.json 的 ims 刷新为 1(state.json 只由守护写)
+	#   实时读不到   -> 按"未知"放行。理由: 读不到多半是串口被占或超时,并不说明 IMS 关着;
+	#                 此时拒绝会把一次可能成功的拨号误拦,放行后若 IMS 真的关着,模组会对 ATD 回
+	#                 ERROR/NO CARRIER,走下面既有的 at_error 错误路径,用户照样得到明确失败,没有额外风险。
+	if [ "$ST_IMS" = "0" ]; then
+		resolve_sendat
+		case "$(ims_live)" in
+			0) die 409 ims_off "短信功能(IMS)未开启,无法拨打电话。请到「短信中心 → 设置 → 短信开关」打开,等约一分钟后再试" ;;
+			1) write_hint "ims 1 $(uptime_int)"; log "dial 前实时复核 IMS 已开,放行" ;;
+			*) log "dial 前实时复核 IMS 读不到,按未知放行" ;;
+		esac
+	fi
+	# 限频: 任何一次尝试(成功/不确定/失败)后 30 秒内不许再拨,每小时最多 20 次
+	_up=$(uptime_int)
+	_hist="$D/dial.hist"
+	_cnt=0; _last=0
+	if [ -f "$_hist" ]; then
+		for _t in $(cat "$_hist" 2>/dev/null); do
+			case "$_t" in ''|*[!0-9]*) continue ;; esac
+			[ $((_up - _t)) -le 3600 ] && _cnt=$((_cnt + 1))
+			[ "$_t" -gt "$_last" ] && _last=$_t
+		done
+	fi
+	if [ "$_last" -gt 0 ] && [ $((_up - _last)) -lt 30 ]; then
+		die 429 rate_limited "拨号过于频繁,请 30 秒后再试"
+	fi
+	[ "$_cnt" -ge 20 ] && die 429 rate_limited "每小时最多拨号 20 次"
+	{ for _t in $(cat "$_hist" 2>/dev/null); do
+		case "$_t" in ''|*[!0-9]*) continue ;; esac
+		[ $((_up - _t)) -le 3600 ] && echo "$_t"
+	  done; echo "$_up"; } > "$_hist.new" 2>/dev/null && mv "$_hist.new" "$_hist"
+
+	resolve_sendat
+	# 外层 timeout 必须大于 sendat 自己的 8 秒等锁 + 5 秒读回包,免得 ATD 已写入串口却被误杀
+	_out=$(timeout 20 "$SENDAT" 1 "ATD${_n};" 5 2>&1)
+	_last4=$(printf '%s' "$_n" | tail -c 4)
+	case "$_out" in
+		*ERROR*)
+			_c=$(err_code "$_out")
+			log "dial ****$_last4 失败 err=$_c via=$VIA"
+			die 502 at_error "模组拒绝了拨号命令${_c:+(错误码 $_c)}"
+			;;
+		*BUSY*|*"NO CARRIER"*)
+			log "dial ****$_last4 失败 busy/nocarrier via=$VIA"
+			die 502 at_error "对方忙或网络无法接通"
+			;;
+		*OK*)
+			write_hint "dial $_n $(uptime_int)"
+			log "dial ****$_last4 已发出 via=$VIA"
+			printf '{"ok":true,"state":"dialing","via":"%s"}\n' "$VIA"
+			;;
+		*)
+			write_hint "dial $_n $(uptime_int)"
+			log "dial ****$_last4 无回包(不确定) via=$VIA"
+			printf '{"ok":true,"state":"dialing","uncertain":1,"msg":"命令超时,呼叫可能已发出,请观察状态,切勿重复拨打","via":"%s"}\n' "$VIA"
+			;;
+	esac
+}
+
+cmd_answer() {
+	precheck
+	take_lock
+	state_get
+	[ "$ST_CALL" = "ringing" ] || die 409 not_ringing "当前没有来电"
+	resolve_sendat
+	_out=$(timeout 15 "$SENDAT" 1 "ATA" 5 2>&1)
+	case "$_out" in
+		*ERROR*)
+			_c=$(err_code "$_out")
+			log "answer 失败 err=$_c via=$VIA"
+			die 502 at_error "模组拒绝了接听命令${_c:+(错误码 $_c)}"
+			;;
+		*OK*)
+			write_hint "answer $(uptime_int)"
+			log "answer 已发出 via=$VIA"
+			printf '{"ok":true,"state":"active","via":"%s"}\n' "$VIA"
+			;;
+		*)
+			write_hint "answer $(uptime_int)"
+			log "answer 无回包 via=$VIA"
+			die 504 at_timeout "接听命令没有回包,请观察通话状态"
+			;;
+	esac
+}
+
+cmd_hangup() {
+	precheck
+	take_lock
+	state_get
+	case "$ST_CALL" in
+		ended)
+			printf '{"ok":true,"state":"ended","via":"real"}\n'
+			return
+			;;
+		ringing|dialing|alerting|active) ;;
+		*) die 409 no_call "当前没有通话" ;;      # s101sec: idle 与读不到状态都不发 ATH
+	esac
+	resolve_sendat
+	_out=$(timeout 15 "$SENDAT" 1 "ATH" 5 2>&1)
+	write_hint "hangup $(uptime_int)"
+	now_nap
+	_clcc=$(timeout 5 "$SENDAT" 1 "AT+CLCC" 2 2>&1)
+	_chup=""
+	case "$_clcc" in
+		*+CLCC:*)
+			_chup=$(timeout 15 "$SENDAT" 1 "AT+CHUP" 5 2>&1)
+			;;
+	esac
+	log "hangup 已发出 via=$VIA"
+	# 全程没有任何回包才报超时; 其余一律 ok,由守护继续观察真实状态
+	if [ -z "$(printf '%s' "$_out$_clcc$_chup" | tr -d ' \r\n')" ]; then
+		die 504 at_timeout "挂断命令没有回包,请观察通话状态"
+	fi
+	printf '{"ok":true,"state":"ended","via":"%s"}\n' "$VIA"
+}
+
+case "$1" in
+	dial) shift; cmd_dial "$1" ;;
+	answer) cmd_answer ;;
+	hangup) cmd_hangup ;;
+	which) resolve_sendat; echo "$SENDAT" ;;
+	present) if is_present; then echo present; exit 0; else echo absent; exit 1; fi ;;
+	*) echo "用法: mwrt-phone-ctl dial <号码> | answer | hangup | which | present" >&2; exit 2 ;;
+esac

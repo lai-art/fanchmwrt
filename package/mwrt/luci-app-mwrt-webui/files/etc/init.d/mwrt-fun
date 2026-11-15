@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+# 趣玩中心开关的配置触发(没有常驻进程)。
+#   「Mwrt设定 -> 界面与趣玩 -> 趣玩中心」保存并应用后, mwrt 配置提交, procd 触发 reload:
+#     关 -> 清掉缓存和 LuCI 菜单索引, 侧栏菜单立刻消失, 不再联系服务器;
+#     开 -> 开关值真的从关变成开才向更新服务器问一次(别的选项的保存不联网), 联网失败(sync 退出码 2)再由 boot 子命令后台重试。
+# 写法同 /etc/init.d/mwrt-usbnic: 只用 procd 的配置触发器, 不注册实例。
+# 开机那次检测不在这里做, 由 hotplug ifup(99-mwrt-fun)在外网口起来后叫起。
+START=97
+USE_PROCD=1
+
+start_service() {
+	# 开机时没有要做的事: 缓存在 /tmp 本来就是空的, 联网检测由 hotplug 触发
+	return 0
+}
+
+service_triggers() {
+	procd_add_reload_trigger mwrt
+}
+
+reload_service() {
+	[ -x /usr/libexec/mwrt-fun ] || return 0
+	# 放后台: 联网问服务器最长十几秒, 别拖住 uci apply。
+	# 只有 sync 说"该联网但没成功"(退出码 2)才接着起 boot 重试; 其余情况(关/没变/已有缓存)到此为止
+	( /usr/libexec/mwrt-fun sync; [ "$?" = 2 ] && /usr/libexec/mwrt-fun boot ) >/dev/null 2>&1 &
+}

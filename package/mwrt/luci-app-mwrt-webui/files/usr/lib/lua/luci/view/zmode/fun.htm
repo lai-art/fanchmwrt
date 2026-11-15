@@ -1,0 +1,109 @@
+<%+header%>
+<style>
+	/* 趣玩中心嵌入页：和 WEB 界面（webui.htm）一样铺满右侧内容区。
+	   类名只在本页由下面的脚本加上，别的页面不受影响；
+	   aurora 皮肤桌面端对 #maincontent 的内边距带 !important，这里同样用 :not(#…) 叠优先级。 */
+	.main-right:not(#mw-n) > #maincontent.mw-embed-full { padding: 0 !important; }
+	/* s133 手机端 aurora(chrome.css 768px 断点)给 #maincontent 设了 flex:none!important，
+	   整块只剩 #mwfun 的最小高度 320px、挤在顶部；嵌入页单独撑回去(桌面本来就是 flex:1)。 */
+	.main-right:not(#mw-n) > #maincontent.mw-embed-full { flex: 1 1 auto !important; min-height: 0 !important; }
+	.main-right:not(#mw-n) > #maincontent.mw-embed-full > .container.mw-embed-full {
+		display: flex !important;
+		flex-direction: column !important;
+		max-width: none !important;
+		width: auto !important;
+		margin: 0 !important;
+		padding: 0 !important;
+	}
+	.main-right:not(#mw-n) > #maincontent.mw-embed-full > .container.mw-embed-full > #mwfun { flex: 1 1 auto; min-height: 0; }
+
+	#mwfun { display: flex; flex-direction: column; min-height: 320px; background: #fff; }
+	/* s146 手机端：整块做成圆角卡片，上沿和顶栏留 6px 缝，下沿正好落在悬浮底栏上方 6px */
+	@media (max-width: 768px) {
+		.main-right:not(#mw-n) > #maincontent.mw-embed-full > .container.mw-embed-full > #mwfun {
+			margin-top: 6px; border-radius: 16px; overflow: hidden; isolation: isolate;
+			box-shadow: 0 1px 2px rgb(16 24 40 / .05), 0 4px 16px rgb(16 24 40 / .07);
+		}
+		#mwfun iframe { border-radius: 16px; }
+	}
+	#mwfun .mwf-stage { position: relative; flex: 1 1 auto; min-height: 0; }
+	#mwfun iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #fff; }
+	#mwfun .mwf-load, #mwfun .mwf-fb {
+		position: absolute; inset: 0; z-index: 2; background: #fff;
+		display: flex; flex-direction: column; align-items: center; justify-content: center;
+		gap: .75rem; padding: 1.5rem; text-align: center; color: #5a6680; font-size: .875rem;
+	}
+	#mwfun [hidden] { display: none !important; }
+	#mwfun .mwf-fb b { font-size: 1.0625rem; color: #1f2a3d; }
+	#mwfun .mwf-go {
+		display: inline-block; padding: .55rem 1.6rem; border-radius: .6rem; text-decoration: none;
+		background: #0e7490; color: #fff; font-weight: 600;
+	}
+	#mwfun .mwf-go:hover { background: #0b5f76; color: #fff; }
+</style>
+
+<div id="mwfun" data-go="<%=pcdata(gourl)%>" data-name="<%=pcdata(item.name)%>" data-mode="<%=pcdata(item.mode)%>" data-state="<%=state%>">
+	<div class="mwf-stage">
+		<iframe id="mwf-frame" title="趣玩中心" referrerpolicy="no-referrer"
+			sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-modals"></iframe>
+		<div class="mwf-load" id="mwf-load">正在加载…</div>
+		<div class="mwf-fb" id="mwf-fb" hidden>
+			<b id="mwf-fb-title"></b>
+			<span id="mwf-fb-msg"></span>
+			<a class="mwf-go" id="mwf-go" target="_blank" rel="noopener noreferrer">在新窗口打开</a>
+		</div>
+	</div>
+</div>
+
+<script>
+(function () {
+	var box = document.getElementById('mwfun');
+	var go = box.getAttribute('data-go') || '';
+	var state = box.getAttribute('data-state') || 'bad';
+	var name = box.getAttribute('data-name') || '';
+	var mode = box.getAttribute('data-mode');
+	var frame = document.getElementById('mwf-frame');
+	var load = document.getElementById('mwf-load');
+	var fb = document.getElementById('mwf-fb');
+	var timer = 0;
+
+	var mc = document.getElementById('maincontent');
+	if (mc) { mc.classList.add('mw-embed-full'); if (mc.firstElementChild) mc.firstElementChild.classList.add('mw-embed-full'); }
+
+	/* 真实网址不在页面里：内嵌和“在新窗口打开”都走设备上的跳转地址 go，由设备现跳。
+	   网址是否有效、是否同源、是否混合内容，设备已判断好放在 data-state */
+	var goBtn = document.getElementById('mwf-go');
+	if (state === 'bad') goBtn.hidden = true; else goBtn.href = go;
+
+	function fallback(title, msg) {
+		clearTimeout(timer);
+		load.hidden = true;
+		document.getElementById('mwf-fb-title').textContent = title;
+		document.getElementById('mwf-fb-msg').textContent = msg;
+		fb.hidden = false;
+	}
+
+	if (state === 'bad')
+		return fallback('网址无效', '这个子菜单的网址不能打开，请联系管理员检查服务器上的配置。');
+	if (mode !== 'embed')
+		return fallback(name, '这个页面设置为在新窗口中打开。');
+	/* 和后台同源的网址不嵌入：同源页面里的脚本能直接操作整个后台 */
+	if (state === 'same')
+		return fallback(name, '出于安全考虑，本机地址的页面不在后台内嵌入，请在新窗口打开。');
+	/* HTTPS 后台里的 http:// 内嵌会被浏览器当混合内容直接拦掉，页面是空白的，不如直说 */
+	if (state === 'mixed')
+		return fallback(name, '当前后台是 HTTPS，浏览器会拦截 http:// 开头的内嵌页面，请在新窗口打开。');
+
+	/* load 事件先挂再设 src，免得赶不上 */
+	frame.addEventListener('load', function () {
+		clearTimeout(timer);
+		load.hidden = true;
+		fb.hidden = true;
+	});
+	timer = setTimeout(function () {
+		fallback('页面加载较慢', '对方网站可能不允许被嵌入，或者网络较慢。可以继续等待，也可以直接在新窗口打开。');
+	}, 12000);
+	frame.src = go;
+})();
+</script>
+<%+footer%>

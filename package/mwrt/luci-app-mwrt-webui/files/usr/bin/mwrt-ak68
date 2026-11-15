@@ -1,0 +1,267 @@
+#!/bin/sh
+# NRadio C5800 only: POE port (lan4) / external AK68 handling.
+#   mwrt-ak68 daemon        procd main loop: apply POE switch, detect AK68, stop/restore the built-in 5700 network
+#   mwrt-ak68 status        print state json (same content as /tmp/mwrt-ak68.json)
+#   mwrt-ak68 poe on|off    persist + apply the POE power switch
+# The built-in 5700 reaches the network through the 2.5G PHY eth1 (network.cell/cellv6); an AK68 hangs on the
+# POE port lan4 and answers on the very same 192.168.8.1 / 192.168.225.1, so the built-in one must go down.
+STATE=/tmp/mwrt-ak68.json
+POEGPIO=${AK68_POEGPIO:-/sys/class/gpio/cpe1-pwr/value}   # AK68_POEGPIO 只给台架测试用
+PORT=lan4
+CELL=eth1
+# ATSD: 接了 AK68 后, WEBUI / LED 的 AT 不再碰内置模组串口, 一律经 atsd_tools(AK68 的 AT 口 TCP 代理)走 atsd_tools_cli -i cpe。
+#   ATSDGO  = 允许 /etc/init.d/atsd_tools 起来的标志(只有本守护识别到 AK68 才立, 其余任何时候 init 都什么也不起)
+#   ATSDON  = ATSD 已和 AK68 里的模组对上话(ATI 回 OK)才立; 各处 AT 通道以它为准, 没有它就照旧走内置模组
+ATSDGO=/tmp/mwrt-ak68.atsdgo
+ATSDON=/tmp/mwrt-ak68.atsd
+ATSDCLI=/usr/bin/atsd_tools_cli
+# LAN4 自动识别(见 lan4_is_wan 一节): 自动切 WAN 前的原设置存档(在 /etc, 断电重启后还在)和探测结果
+PREV=/etc/mwrt-ak68.prev
+PROBEF=/tmp/mwrt-ak68.probe
+
+is_c5800() {
+	case "$(cat /tmp/sysinfo/board_name 2>/dev/null)|$(cat /tmp/sysinfo/model 2>/dev/null)" in
+		*[Cc]5800*) return 0 ;;
+	esac
+	return 1
+}
+is_c5800 || exit 0
+
+cfg() { uci -q get mwrt_ak68.main."$1"; }
+
+# cpe1-pwr is active-low in the DTS, sysfs value 1 = logical "asserted" = POE powered
+poe_actual() { [ -r "$POEGPIO" ] && cat "$POEGPIO" 2>/dev/null || echo 0; }
+poe_apply() {
+	want=$(cfg poe); [ -n "$want" ] || want=1
+	[ -w "$POEGPIO" ] || return 0
+	[ "$(poe_actual)" = "$want" ] || echo "$want" > "$POEGPIO"
+}
+
+# lan4 对端网关。不能只看内核默认路由: AK68 和内置 5700 用同一个 192.168.8.0/24, 网关存活切线路时会把 lan4 的
+# 默认路由删掉(或另一条同网段路由顶掉它), 路由表里没有 lan4 的默认路由不等于没接 AK68。
+# 所以依次取: 内核默认路由 -> netifd 记的 wan 网关 -> 按 lan4 自己拿到的地址推出网段的 .1; 只认两种 AK68 网关。
+wan_gw() {
+	for g in 		"$(ip -4 route show default dev "$PORT" 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}')" 		"$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' 2>/dev/null | head -n1)" 		"$(ip -4 addr show dev "$PORT" 2>/dev/null | awk '/inet /{split($2,a,"/"); n=split(a[1],b,"."); print b[1]"."b[2]"."b[3]".1"; exit}')"
+	do
+		case "$g" in 192.168.8.1|192.168.225.1) echo "$g"; return ;; esac
+	done
+}
+
+write_state() {
+	# $1 present  $2 gw  $3 cell_stopped  $4 lan4 角色(wan|lan)
+	car=0; [ "$(cat /sys/class/net/$PORT/carrier 2>/dev/null)" = "1" ] && car=1
+	kind=""
+	case "$2" in 192.168.8.1) kind=mt5700 ;; 192.168.225.1) kind=rm520n ;; esac
+	at=0; [ -e "$ATSDON" ] && at=1
+	asw=0; [ -d "$PREV" ] && asw=1
+	printf '{"present":%s,"gw":"%s","kind":"%s","poe":%s,"poe_cfg":"%s","carrier":%s,"cell_stopped":%s,"auto":"%s","atsd":%s,"role":"%s","autosw":%s}\n' \
+		"$1" "$2" "$kind" "$(poe_actual)" "$(cfg poe)" "$car" "$3" "$(cfg auto)" "$at" "$4" "$asw" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
+
+# ---- LAN4 自动识别: 不管用户把 LAN4 设成 LAN 还是 WAN 都要认得出 AK68 ----
+# LAN4 是 WAN 时靠上面的 wan_gw + ping 识别; 是 LAN(网桥成员, 没有地址)时靠在这个口上单独发一次 DHCP 发现:
+# 从口上直接发(不进网桥, 本机 dnsmasq 听不到), 只认 AK68 的两种网关(它里面的 DHCP 服务器地址)。
+# 认到后把用户原来的网络设置(网桥成员 / wan、wan6 段 / 网关存活主口)整份存进 $PREV, 把 LAN4 切成 DHCP 的 WAN;
+# 拔掉(或 POE 断电/关自动识别/切了之后一直没识别成功)就按 $PREV 原样还原。$PREV 目录在, 就表示"现在是自动切的"。
+# 用户自己在网口设置里改 LAN4(modem.lua c8port_set)会把 $PREV 删掉, 以用户的选择为准。
+lan4_is_wan() {
+	[ "$(uci -q get network.wan.device)" = "$PORT" ] && [ "$(uci -q get network.wan.disabled)" != "1" ]
+}
+br_sec() { uci -q show network | sed -n "s/^network\.\([^.=]*\)\.name='br-lan'\$/\1/p" | head -n1; }
+net_apply() {
+	/etc/init.d/network reload >/dev/null 2>&1
+	sleep 6
+	/etc/init.d/firewall reload >/dev/null 2>&1
+}
+# 探测: LAN4 是网桥成员时, udhcpc 自己收不到应答(包在网桥那一层就被收走了, 只有抓包能看到), 所以
+# udhcpc 只负责从口上发 DHCP 发现(不进网桥, 本机 dnsmasq 听不到), 应答交给 tcpdump 听:
+# 只要这个口"收到"来自 192.168.8.1 / 192.168.225.1 的 IP 包(AK68 的两种网关)就算认到。
+probe_ak68() {
+	rm -f "$PROBEF"
+	command -v tcpdump >/dev/null 2>&1 && [ -x /sbin/udhcpc ] || return 1
+	timeout 5 tcpdump -i "$PORT" -Q in -n -l -q -c 1 'ip src host 192.168.8.1 or ip src host 192.168.225.1' > "$PROBEF" 2>/dev/null &
+	tp=$!
+	sleep 1
+	timeout 3 udhcpc -i "$PORT" -n -q -f -t 2 -T 1 -s /bin/true >/dev/null 2>&1
+	wait "$tp" 2>/dev/null
+	[ -s "$PROBEF" ]
+}
+to_wan() {
+	br=$(br_sec); [ -n "$br" ] || return 1
+	rm -rf "$PREV" "$PREV.tmp"
+	mkdir -p "$PREV.tmp" || return 1
+	uci -q get network."$br".ports > "$PREV.tmp/ports"
+	uci -q export network | awk '/^config /{p=($0 ~ /^config interface .(wan|wan6).$/)} p' > "$PREV.tmp/wan.blk"
+	uci -q get Mwrt-Assurance.wan_failover.enabled > "$PREV.tmp/fo_en"
+	uci -q get Mwrt-Assurance.wan_failover.primary_if > "$PREV.tmp/fo_pri"
+	[ -s "$PREV.tmp/ports" ] || { rm -rf "$PREV.tmp"; return 1; }
+	mv "$PREV.tmp" "$PREV" || return 1
+	uci -q delete network."$br".ports
+	for p in $(cat "$PREV/ports"); do [ "$p" = "$PORT" ] || uci add_list network."$br".ports="$p"; done
+	uci -q delete network.wan; uci -q delete network.wan6
+	uci set network.wan=interface; uci set network.wan.device="$PORT"; uci set network.wan.proto=dhcp
+	uci set network.wan6=interface; uci set network.wan6.device="$PORT"; uci set network.wan6.proto=dhcpv6
+	uci commit network
+	if uci -q get Mwrt-Assurance.wan_failover >/dev/null; then
+		uci set Mwrt-Assurance.wan_failover.enabled=1
+		uci set Mwrt-Assurance.wan_failover.primary_if="$PORT"
+		uci commit Mwrt-Assurance
+	fi
+	net_apply
+	return 0
+}
+to_prev() {
+	[ -d "$PREV" ] || return 0
+	br=$(br_sec)
+	if [ -n "$br" ] && [ -s "$PREV/ports" ]; then
+		uci -q delete network."$br".ports
+		for p in $(cat "$PREV/ports"); do uci add_list network."$br".ports="$p"; done
+	fi
+	uci -q delete network.wan; uci -q delete network.wan6
+	uci commit network
+	# wan/wan6 原段(含列表项)是 uci export 出来的文本, 直接接回配置文件末尾
+	[ -s "$PREV/wan.blk" ] && { echo >> /etc/config/network; cat "$PREV/wan.blk" >> /etc/config/network; }
+	if uci -q get Mwrt-Assurance.wan_failover >/dev/null; then
+		en=$(cat "$PREV/fo_en" 2>/dev/null); pri=$(cat "$PREV/fo_pri" 2>/dev/null)
+		if [ -n "$en" ]; then uci set Mwrt-Assurance.wan_failover.enabled="$en"; else uci -q delete Mwrt-Assurance.wan_failover.enabled; fi
+		if [ -n "$pri" ]; then uci set Mwrt-Assurance.wan_failover.primary_if="$pri"; else uci -q delete Mwrt-Assurance.wan_failover.primary_if; fi
+		uci commit Mwrt-Assurance
+	fi
+	rm -rf "$PREV"
+	net_apply
+	# 网关存活装的默认路由不归 netifd 管, 回 LAN 后清掉还挂在 LAN4 上的
+	for i in 1 2 3 4; do ip route del default dev "$PORT" 2>/dev/null || break; done
+}
+
+# 拉起 ATSD 并核对通路: $1 = mt5700 | rm520n。AK68 里是哪种模组, atsd_tools 就挂哪条规则(MT5700→192.168.8.1:20249, RM520N→192.168.225.1:1555)。
+# 短信转发的读取来源跟着 ATSD 通路变(AK68 的卡 / 内置卡): 换来源前停掉 smsforward, 换完再把它按对应那份转发记录拉起来。
+# 脚本由 smsforward 的 init 脚本和这里调用, 没装时什么也不做; 细节见 /usr/libexec/mwrt-sms/smssrc 开头的说明。
+SMSSRC=/usr/libexec/mwrt-sms/smssrc
+sms_pre() { [ -x "$SMSSRC" ] && "$SMSSRC" pre; return 0; }
+sms_post() { [ -x "$SMSSRC" ] && "$SMSSRC" post; return 0; }
+
+atsd_up() {
+	m=MT5700M-CN; [ "$1" = "rm520n" ] && m=RM520N-CN
+	[ -x "$ATSDCLI" ] && [ -x /etc/init.d/atsd_tools ] || return 0
+	smspre=0
+	if [ "$(uci -q get atsd_tools.cpe.model)" != "$m" ] || ! pidof atsd_tools >/dev/null 2>&1; then
+		[ -e "$ATSDON" ] && { sms_pre; smspre=1; }
+		rm -f "$ATSDON"
+		: > "$ATSDGO"
+		uci -q set atsd_tools.cpe.model="$m" && uci -q commit atsd_tools
+		/etc/init.d/atsd_tools restart >/dev/null 2>&1
+		sleep 1
+	fi
+	[ -e "$ATSDON" ] && return 0
+	if "$ATSDCLI" -i cpe -c ATI -w 2000 2>/dev/null | grep -q OK; then
+		[ "$smspre" = "1" ] || sms_pre
+		: > "$ATSDON"
+		sms_post
+		logger -t mwrt-ak68 "ATSD ready ($m), WEBUI/LED AT now goes through AK68"
+	elif [ "$smspre" = "1" ]; then
+		# 重启 ATSD 没成功: 来源退回内置卡, 把刚停掉的转发按内置卡的记录拉起来
+		sms_post
+	fi
+}
+atsd_down() {
+	sms_pre
+	rm -f "$ATSDON" "$ATSDGO"
+	/etc/init.d/atsd_tools stop >/dev/null 2>&1
+	sms_post
+}
+
+# 不用 ifdown/ifup: 这台机器上 `ifdown cell` 报 "Interface  not found" 而且什么也没做(内置蜂窝接口一直开着)
+cell_down() {
+	ubus call network.interface.cell down >/dev/null 2>&1
+	ubus call network.interface.cellv6 down >/dev/null 2>&1
+}
+cell_up() {
+	ubus call network.interface.cell up >/dev/null 2>&1
+	ubus call network.interface.cellv6 up >/dev/null 2>&1
+}
+
+daemon() {
+	present=0; hit=0; miss=0; stopped=0; lastgw=""; atsd=0
+	phit=0; lastprobe=0; cool=0; gone=0; swat=$(date +%s)
+	[ -f "$STATE" ] && rm -f "$STATE"
+	rm -f "$ATSDON" "$ATSDGO"
+	while :; do
+		poe_apply
+		auto=$(cfg auto); [ -n "$auto" ] || auto=1
+		now=$(date +%s)
+		role=lan; lan4_is_wan && role=wan
+		car=$(cat /sys/class/net/$PORT/carrier 2>/dev/null)
+		gw=$(wan_gw)
+		ok=0
+		if [ "$auto" = "1" ] && [ "$(poe_actual)" = "1" ] && [ "$car" = "1" ]; then
+			case "$gw" in
+				192.168.8.1|192.168.225.1) ping -c1 -W1 -I "$PORT" "$gw" >/dev/null 2>&1 && ok=1 ;;
+			esac
+		fi
+		if [ "$ok" = "1" ]; then hit=$((hit+1)); miss=0; else miss=$((miss+1)); hit=0; fi
+		if [ "$present" = "0" ] && [ "$hit" -ge 2 ]; then
+			present=1; lastgw=$gw; gone=0
+			logger -t mwrt-ak68 "AK68 已接入 $PORT（$gw），停用内置模组的网络"
+		elif [ "$present" = "1" ] && [ "$miss" -ge 3 ]; then
+			present=0; gone=1
+			logger -t mwrt-ak68 "AK68 已拔掉，恢复内置模组的网络"
+		fi
+		# 自动切过 WAN 的情况: AK68 拔了 / POE 断了 / 关了自动识别 / 切了 2 分钟都没认出来(接的其实不是 AK68)
+		# => 把 LAN4 和网络设置还原成用户原来的样子; 没认出来的话冷却 5 分钟再探测, 免得来回切
+		if [ -d "$PREV" ] && [ "$present" = "0" ]; then
+			if [ "$gone" = "1" ] || [ "$auto" != "1" ] || [ "$(poe_actual)" != "1" ] || [ $((now - swat)) -ge 120 ]; then
+				[ "$gone" = "1" ] || cool=$((now + 300))
+				logger -t mwrt-ak68 "LAN4 还原为切换前的设置"
+				to_prev
+				gone=0; phit=0
+				role=lan; lan4_is_wan && role=wan
+			fi
+		fi
+		# LAN4 现在是 LAN 口(没有地址, 上面的网关识别用不上): 在口上主动探测 AK68, 连续两次认到就自动切成 WAN
+		if [ "$present" = "0" ] && [ ! -d "$PREV" ] && [ "$role" = "lan" ] && [ "$auto" = "1" ] && 			[ "$(poe_actual)" = "1" ] && [ "$car" = "1" ] && [ "$now" -ge "$cool" ]; then
+			iv=12; [ "$phit" -gt 0 ] && iv=4
+			if [ $((now - lastprobe)) -ge "$iv" ]; then
+				lastprobe=$now
+				if probe_ak68; then phit=$((phit+1)); else phit=0; fi
+				if [ "$phit" -ge 2 ]; then
+					phit=0
+					logger -t mwrt-ak68 "LAN4 是 LAN 口，探测到 AK68，自动切换为 WAN"
+					if to_wan; then swat=$(date +%s); gone=0; role=wan; fi
+				fi
+			fi
+		else
+			phit=0
+		fi
+		if [ "$present" = "1" ]; then
+			# keep the built-in cellular interfaces down (netifd may bring them up again after any reload)
+			if [ "$(ubus call network.interface.cell status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = "true" ] || [ "$stopped" = "0" ]; then
+				cell_down
+			fi
+			stopped=1
+			case "$lastgw" in 192.168.8.1) atsd_up mt5700 ;; 192.168.225.1) atsd_up rm520n ;; esac
+			atsd=1
+			write_state 1 "$lastgw" 1 "$role"
+		else
+			if [ "$atsd" = "1" ]; then atsd_down; atsd=0; fi
+			if [ "$stopped" = "1" ]; then cell_up; stopped=0; fi
+			write_state 0 "" 0 "$role"
+		fi
+		sleep 3
+	done
+}
+
+case "$1" in
+	daemon) daemon ;;
+	probe) probe_ak68 && echo "yes $(cat $PROBEF 2>/dev/null)" || echo no ;;
+	status) [ -f "$STATE" ] && cat "$STATE" || echo '{"present":0}' ;;
+	poe)
+		case "$2" in
+			on) uci -q set mwrt_ak68.main.poe=1 ;;
+			off) uci -q set mwrt_ak68.main.poe=0 ;;
+			*) echo "usage: $0 poe on|off" >&2; exit 1 ;;
+		esac
+		uci -q commit mwrt_ak68
+		poe_apply
+		;;
+	*) echo "usage: $0 daemon|status|probe|poe on|off" >&2; exit 1 ;;
+esac

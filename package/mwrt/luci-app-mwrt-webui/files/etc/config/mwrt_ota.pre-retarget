@@ -1,0 +1,4 @@
+
+config ota 'main'
+	option server 'https://103.233.254.163'
+	option auto_check '1'

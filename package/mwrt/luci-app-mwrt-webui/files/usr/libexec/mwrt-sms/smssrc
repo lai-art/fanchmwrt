@@ -1,0 +1,42 @@
+#!/bin/sh
+# smssrc pre|post|sync —— NRadio C5800 only: 短信转发的"读取来源"切换时, 让转发记录(/etc/smsforward.seen)跟着来源走。
+#
+# 背景: smsforward 靠 /etc/smsforward.seen(时间戳|号码|…|哈希)判断哪些短信转发过, 文件不存在时才把卡里现有短信
+# 记成基线、不转发。C5800 接上 AK68 后读的是 AK68 里那张卡, 拔掉又回内置卡; 两张卡里的短信互不相同,
+# 如果共用一份记录, 一换来源另一张卡里的全部旧短信都会被当成新短信推送一遍。
+# 做法: 每个来源一份记录 /etc/smsforward.seen.<来源>: 来源 = int(内置模组) 或 ak-<AK68 的 IMEI>(换一台 AK68 也算新来源);
+# 当前来源那份就是 /etc/smsforward.seen, 来源变了就把它存回去、换出目标来源那份, 没有就删掉(下次启动按"首次运行"重新记基线)。
+#
+# pre   : 换来源之前停掉 smsforward(免得它在切换瞬间拿旧记录去对新卡的短信)
+# post  : 来源已经换好之后调用: 换记录、开着转发就重新起来
+# sync  : 只换记录(smsforward 的 init 脚本启动前调用, 开机/手动启用也走这里)
+SEEN=/etc/smsforward.seen
+TAG=/etc/smsforward.src
+
+cur_src() {
+	if [ -e /tmp/mwrt-ak68.atsd ]; then
+		id=$(/usr/bin/mwrt-akat 'AT+CGSN' 3 2>/dev/null | tr -d '\r' | grep -o '[0-9]\{14,16\}' | head -n1)
+		echo "ak-${id:-x}"
+	else
+		echo int
+	fi
+}
+
+sync() {
+	want=$(cur_src); have=$(cat "$TAG" 2>/dev/null); [ -n "$have" ] || have=int
+	[ "$want" = "$have" ] && return 0
+	[ -f "$SEEN" ] && mv -f "$SEEN" "$SEEN.$have"
+	if [ -f "$SEEN.$want" ]; then mv -f "$SEEN.$want" "$SEEN"; else rm -f "$SEEN"; fi
+	echo "$want" > "$TAG"
+	logger -t smssrc "短信转发读取来源: $have -> $want"
+}
+
+enabled() { [ "$(uci -q get smsforward.settings.enable)" = "1" ]; }
+
+case "$1" in
+pre)  enabled && { /etc/init.d/smsforward stop >/dev/null 2>&1; sleep 1; } ;;
+post) sync; enabled && /etc/init.d/smsforward restart >/dev/null 2>&1 ;;
+sync) sync ;;
+*)    echo "用法: smssrc pre|post|sync" >&2; exit 1 ;;
+esac
+exit 0

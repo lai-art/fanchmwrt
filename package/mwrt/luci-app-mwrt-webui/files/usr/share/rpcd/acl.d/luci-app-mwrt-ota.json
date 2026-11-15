@@ -1,0 +1,17 @@
+{
+	"luci-app-mwrt-ota": {
+		"description": "Grant access to online firmware update",
+		"read": {
+			"ubus": {
+				"luci.mwrt-ota": [ "info", "latest", "progress", "keep_probe" ]
+			},
+			"uci": [ "mwrt_ota" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.mwrt-ota": [ "check", "download", "cancel", "verify", "test", "upgrade", "set_auto" ]
+			},
+			"uci": [ "mwrt_ota" ]
+		}
+	}
+}

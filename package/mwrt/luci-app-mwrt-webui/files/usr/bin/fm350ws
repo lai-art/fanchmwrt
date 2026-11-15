@@ -1,0 +1,424 @@
+#!/usr/bin/lua
+-- fm350ws: FM350 / RM520 WEBUI 的轻量后端(Lua + nixio,常驻约 1MB),替代 python 版 fm350webserver.py(约 25MB)。
+--
+-- 协议与旧版逐字兼容(前端 SPA 一行不用改):
+--   WebSocket 0.0.0.0:<端口>(默认读 /usr/bin/config.json 的 WEBSOCKET.PORT,即 8766)
+--   收 {"id":..,"cmd":".."} 或纯文本,回 {"id":..,"result":".."}(无 id 则回纯文本)
+--   CMD(<shell>)        执行系统命令,5 秒超时,回 输出\nOK 或 输出\nERROR
+--   SEND_SMS,<短信中心>,<号码>,"<内容>"   UCS2 PDU 发短信,回 OK / SEND_FAIL: .. / ERROR: ..
+--   其余当 AT 指令
+--
+-- AT 通路:普通 AT 走和 5700 同一个 sendat 垫片(/usr/share/modem/webuiserver-shim,
+--   ubus at-daemon + /tmp/sendat.at.lock 错开 qmodem + 串线重发),不再自己直开串口/起 tom_modem;
+--   发短信走 ubus at-daemon 的 end_flag / raw_at_content 原生调用(等 ">" 再发 PDU+Ctrl-Z)。
+-- 用法:fm350ws [端口]
+
+local nixio = require "nixio"
+local ubus  = require "ubus"
+local json  = require "luci.jsonc"
+local bit   = nixio.bit
+local band, bor, bxor, lshift, rshift = bit.band, bit.bor, bit.bxor, bit.lshift, bit.rshift
+
+pcall(nixio.signal, 15, "dfl")   -- procd 停服务发的 SIGTERM 要能直接结束(否则要等 5 秒被 SIGKILL,重启时新实例抢不到端口)
+pcall(nixio.signal, 13, "ign")
+
+local CFG_FILE = "/usr/bin/config.json"
+local SHIM     = "/usr/share/modem/webuiserver-shim"
+local M32      = 4294967296
+local MAXMSG   = 1048576
+local MAXCLI   = 12
+
+-- ---------- 基础工具 ----------
+local function readfile(p)
+	local f = io.open(p, "r"); if not f then return nil end
+	local s = f:read("*a"); f:close(); return s
+end
+local function trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
+local function shq(s) return "'" .. (s:gsub("'", "'\\''")) .. "'" end
+
+local cfg = json.parse(readfile(CFG_FILE) or "") or {}
+local PORT = tonumber(arg and arg[1]) or (cfg.WEBSOCKET and tonumber(cfg.WEBSOCKET.PORT)) or 8766
+local HOST = (cfg.WEBSOCKET and cfg.WEBSOCKET.HOST) or "0.0.0.0"
+
+-- ---------- SHA1 + base64(WebSocket 握手用) ----------
+local function rol(x, n)   -- nixio.bit 的 lshift 超 32 位会溢出报错,改用算术
+	local d = 2 ^ (32 - n)
+	return (x % d) * 2 ^ n + math.floor(x / d)
+end
+local function sha1(msg)
+	local h0, h1, h2, h3, h4 = 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
+	local ml = #msg * 8
+	msg = msg .. "\128" .. string.rep("\0", (55 - #msg) % 64) ..
+		string.char(0, 0, 0, 0, band(rshift(ml, 24), 255), band(rshift(ml, 16), 255), band(rshift(ml, 8), 255), band(ml, 255))
+	for c = 1, #msg, 64 do
+		local w = {}
+		for i = 0, 15 do
+			local a, b, cc, d = msg:byte(c + i * 4, c + i * 4 + 3)
+			w[i] = a * 16777216 + b * 65536 + cc * 256 + d
+		end
+		for i = 16, 79 do w[i] = rol(bxor(bxor(w[i - 3], w[i - 8]), bxor(w[i - 14], w[i - 16])), 1) end
+		local a, b, cc, d, e = h0, h1, h2, h3, h4
+		for i = 0, 79 do
+			local f, k
+			if i < 20 then f = bor(band(b, cc), band(bxor(b, 0xffffffff), d)); k = 0x5A827999
+			elseif i < 40 then f = bxor(bxor(b, cc), d); k = 0x6ED9EBA1
+			elseif i < 60 then f = bor(bor(band(b, cc), band(b, d)), band(cc, d)); k = 0x8F1BBCDC
+			else f = bxor(bxor(b, cc), d); k = 0xCA62C1D6 end
+			local t = (rol(a, 5) + f + e + k + w[i]) % M32
+			e = d; d = cc; cc = rol(b, 30); b = a; a = t
+		end
+		h0 = (h0 + a) % M32; h1 = (h1 + b) % M32; h2 = (h2 + cc) % M32; h3 = (h3 + d) % M32; h4 = (h4 + e) % M32
+	end
+	-- 这版 Lua 的 string.format 对 >= 2^31 的整数报错,每个字拆成高低 16 位再格式化
+	local hex = {}
+	for _, v in ipairs({ h0, h1, h2, h3, h4 }) do hex[#hex + 1] = string.format("%04x%04x", math.floor(v / 65536), v % 65536) end
+	return nixio.bin.unhexlify(table.concat(hex))
+end
+local function accept_key(key)
+	return nixio.bin.b64encode(sha1(key .. "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+end
+
+-- ---------- AT / 系统命令 ----------
+local conn
+local function ubus_call(obj, method, msg)
+	if not conn then conn = ubus.connect() end
+	if not conn then return nil end
+	local r = conn:call(obj, method, msg or {})
+	if not r then conn = nil end   -- 连接可能断了,下次重连
+	return r
+end
+
+local function at_port()
+	local r = ubus_call("at-daemon", "list")
+	if r and r.ports and r.ports[1] and r.ports[1].port then return r.ports[1].port end
+	local p = cfg.SERIAL and cfg.SERIAL.PORT
+	if p and p:sub(1, 5) == "/dev/" then return p end
+	return "/dev/ttyUSB2"
+end
+
+-- 回包首行是回显(ATxxx);回显和本条指令对不上 = 回包被 qmodem/at-daemon 别的轮询读走或串线。
+local function crossed(cmd, out)
+	local first = out:match("^([^\n]*)")
+	if first ~= nil and first:upper():sub(1, 2) == "AT" and first:upper() ~= cmd:upper() then return true end
+	-- 没有回显行时:查询类指令(AT+XXX?)回的 "+YYY:" 对不上 +XXX 也算串线(例如问 CSQ 却回了 CBC)
+	local name = cmd:upper():match("^AT(%+[%w]+)%?$") or cmd:upper():match("^AT(%+[%w]+)$")
+	if name then
+		local got = out:upper():match("^(%+[%w]+):") or out:upper():match("\n(%+[%w]+):")
+		if got and got ~= name then return true end
+	end
+	return false
+end
+
+local function run_at(cmd)
+	cmd = trim(cmd)
+	-- 只读/无副作用的指令(无 "=" 或以 ?/=? 结尾)串线时重发;设置类不重发,免得重复生效
+	local safe = not cmd:find("=", 1, true) or cmd:sub(-1) == "?"
+	local t0, out = os.time(), ""
+	for _ = 1, 5 do
+		local p = io.popen("PATH=" .. SHIM .. ":$PATH sendat 1 " .. shq(cmd) .. " 4 2>&1")
+		out = p and p:read("*a") or ""
+		if p then p:close() end
+		out = trim((out:gsub("\r", "")))
+		if not crossed(cmd, out) then break end
+		if not safe or os.time() - t0 >= 7 then return "无返回" end
+	end
+	if crossed(cmd, out) then return "无返回" end
+	local first, rest = out:match("^([^\n]*)\n(.*)$")
+	if first and first:upper() == cmd:upper() then out = trim(rest) end   -- 去掉回显行
+	if out == "" or out:upper() == cmd:upper() then return "无返回" end
+	return out
+end
+
+local function run_shell(cmdline)
+	local c = cmdline:match("^%s*CMD%((.*)%)%s*$")
+	if not c then return "CMD 语法错误，应为 CMD(<command>)\nERROR" end
+	c = trim(c)
+	local p = io.popen("timeout -s KILL 5 sh -c " .. shq(c) .. " >/tmp/fm350ws.out 2>/tmp/fm350ws.err </dev/null; echo $?")
+	local rc = p and tonumber((p:read("*a") or ""):match("%d+")) or 1
+	if p then p:close() end
+	local out = trim(readfile("/tmp/fm350ws.out") or "")
+	local err = trim(readfile("/tmp/fm350ws.err") or "")
+	os.remove("/tmp/fm350ws.out"); os.remove("/tmp/fm350ws.err")
+	if rc == 137 or rc == 124 then return "系统命令执行超时\nERROR" end
+	local m = out ~= "" and out or (err ~= "" and err or "无返回")
+	return m .. "\n" .. (rc == 0 and "OK" or "ERROR")
+end
+
+-- ---------- 发短信(UCS2 PDU) ----------
+local function swap_digits(num)
+	num = num:gsub("%D", "")
+	if #num % 2 ~= 0 then num = num .. "F" end
+	return (num:gsub("(.)(.)", "%2%1"))
+end
+local function utf16be_hex(s)
+	local t, i, n = {}, 1, #s
+	while i <= n do
+		local b = s:byte(i)
+		local cp, len
+		if b < 0x80 then cp, len = b, 1
+		elseif b >= 0xF0 then cp = b % 8; len = 4
+		elseif b >= 0xE0 then cp = b % 16; len = 3
+		elseif b >= 0xC0 then cp = b % 32; len = 2
+		else cp, len = 0xFFFD, 1 end
+		for k = 1, len - 1 do cp = cp * 64 + ((s:byte(i + k) or 0x80) % 64) end
+		i = i + len
+		if cp >= 0x10000 then
+			cp = cp - 0x10000
+			t[#t + 1] = string.format("%04X%04X", 0xD800 + math.floor(cp / 1024), 0xDC00 + cp % 1024)
+		else
+			t[#t + 1] = string.format("%04X", cp)
+		end
+	end
+	return table.concat(t)
+end
+
+-- 取 AT 口的共享锁 /tmp/sendat.at.lock(和 tom_modem 包装、sendat 垫片同一把)。
+-- qmodem 的 tom_modem 轮询一直在排队抢这把锁,-n 轮询永远抢不过队列,必须阻塞等(排在队尾,通常 1~3 秒)。
+-- fork 一个子进程去 `flock FILE sh -c 'echo $$; exec sleep 30'`:拿到锁就吐出 sleep 的 pid 并占着锁;
+-- 父进程最多等 6 秒,等不到就放弃(不加锁照发);发完 kill 那个 sleep 释放。
+local lsock, clients = nil, {}   -- 子进程里要先关掉继承来的监听/客户端 socket
+
+local function lock_at()
+	if not nixio.fs.access("/tmp/sendat.at.lock") then
+		local f = io.open("/tmp/sendat.at.lock", "a"); if f then f:close() end
+	end
+	local rd, wr = nixio.pipe()
+	if not rd then return nil end
+	local child = nixio.fork()
+	if child == 0 then
+		rd:close()
+		pcall(function() lsock:close() end)
+		for _, c in ipairs(clients) do pcall(function() c.sock:close() end) end
+		nixio.dup(wr, nixio.stdout)
+		nixio.exec("/usr/bin/flock", "/tmp/sendat.at.lock", "sh", "-c", "echo $$; exec sleep 30")
+		os.exit(1)
+	end
+	wr:close()
+	local held
+	local p = { { fd = rd, events = nixio.poll_flags("in") } }
+	if child and nixio.poll(p, 6000) > 0 then
+		held = tonumber((rd:read(32) or ""):match("%d+"))
+	end
+	rd:close()
+	if held then return { child = child, sleeper = held } end
+	if child then nixio.kill(child, 15); nixio.waitpid(child) end
+	return nil
+end
+local function unlock_at(h)
+	if not h then return end
+	nixio.kill(h.sleeper, 15)
+	nixio.waitpid(h.child)
+end
+
+local function send_sms(msg)
+	-- SEND_SMS,<短信中心>,<号码>,"<内容>"(内容里允许带逗号)
+	local parts, pos = {}, 1
+	for _ = 1, 3 do
+		local i = msg:find(",", pos, true)
+		if not i then break end
+		parts[#parts + 1] = msg:sub(pos, i - 1); pos = i + 1
+	end
+	parts[#parts + 1] = msg:sub(pos)
+	if #parts < 4 then return '参数不足，格式应为 SEND_SMS,手机号,"短信内容"' end
+	local smsc, phone = trim(parts[2]), trim(parts[3])
+	local text = (trim(parts[4]):gsub('^"+', ""):gsub('"+$', ""))
+	local sc = swap_digits(smsc)
+	local sc_part = string.format("%02X91%s", #sc / 2 + 1, sc)
+	local digits = phone:gsub("%D", "")
+	local ud = utf16be_hex(text)
+	if #ud / 2 > 140 then return "ERROR: 短信内容过长" end
+	local body = "1100" .. string.format("%02X91", #digits) .. swap_digits(digits) .. "0008" ..
+		"a7" .. string.format("%02X", #ud / 2) .. ud
+	local pdu = sc_part .. body
+	local len = #body / 2
+
+	local port = at_port()
+	local function at(args, tmo)
+		args.at_port = port; args.timeout = tmo
+		return ubus_call("at-daemon", "sendat", args)
+	end
+	local function esc()   -- at-daemon 的 raw 写不可靠,直接往串口写 ESC 退出 ">" 提示状态
+		local f = nixio.open(port, "w")
+		if f then f:write("\27"); f:close() end
+	end
+
+	-- 整段收发持有 /tmp/sendat.at.lock(和 tom_modem 包装、sendat 垫片同一把),别让别的轮询插进 PDU 中间
+	local holder = lock_at()
+	local result
+	repeat
+		local r
+		for _ = 1, 3 do   -- AT+CMGF=0:回包被别人读走(回显对不上)就重发
+			r = at({ at_cmd = "AT+CMGF=0" }, 3)
+			local rs = r and r.response or ""
+			if rs:find("OK", 1, true) and not crossed("AT+CMGF=0", trim((rs:gsub("\r", "")))) then break end
+			r = nil
+		end
+		if not r then result = "AT+CMGF=0 未返回OK"; break end
+		-- at-daemon 按行读,等不到没有换行的 ">" 提示符(实测 end_flag=">" 必超时),
+		-- 所以只发出 AT+CMGS 就不等回包,固定等一小会儿让模组吐出提示符,再发 PDU+Ctrl-Z。
+		r = at({ at_cmd = "AT+CMGS=" .. len, sendonly = true }, 2)
+		if not (r and r.status == "success") then
+			esc()
+			result = "未收到 > 提示符，模块无响应"; break
+		end
+		nixio.nanosleep(0, 800000000)
+		r = at({ raw_at_content = pdu .. "\26" }, 12)
+		local resp = r and (r.response or r.partial_response) or ""
+		if resp:find("+CMGS:", 1, true) then result = "OK"
+		elseif resp:find("+CMS ERROR", 1, true) then result = "SEND_FAIL: " .. resp
+		else esc(); result = "ERROR: " .. resp end
+	until true
+	unlock_at(holder)
+	return result
+end
+
+-- ---------- WebSocket ----------
+local function frame(op, payload)
+	local n, h = #payload, nil
+	if n < 126 then h = string.char(0x80 + op, n)
+	elseif n < 65536 then h = string.char(0x80 + op, 126, rshift(n, 8), band(n, 255))
+	else h = string.char(0x80 + op, 127, 0, 0, 0, 0, band(rshift(n, 24), 255), band(rshift(n, 16), 255), band(rshift(n, 8), 255), band(n, 255)) end
+	return h .. payload
+end
+local function sendall(sock, data)
+	while #data > 0 do
+		local w = sock:send(data)
+		if not w or w <= 0 then return false end
+		data = data:sub(w + 1)
+	end
+	return true
+end
+
+local function reply(c, id, result)
+	local out
+	if id ~= nil and id ~= false and id ~= 0 and id ~= "" then
+		out = json.stringify({ id = id, result = result })
+	else
+		out = result
+	end
+	return sendall(c.sock, frame(1, out))
+end
+
+local function handle(c, text)
+	local g, id = nil, nil
+	local r = json.parse(text)
+	if type(r) == "table" and r.cmd ~= nil then g = tostring(r.cmd); id = r.id else g = trim(text) end
+	if g == "" then return end
+	if trim(g):sub(1, 4) == "CMD(" then return reply(c, id, run_shell(g)) end
+	if g:sub(1, 8) == "SEND_SMS" then return reply(c, id, send_sms(g)) end
+	return reply(c, id, run_at(g))
+end
+
+-- 解帧;返回 false 表示连接该关
+local function pump(c)
+	while true do
+		local b = c.buf
+		if #b < 2 then return true end
+		local b1, b2 = b:byte(1, 2)
+		local op, masked, len, off = band(b1, 15), band(b2, 128) ~= 0, band(b2, 127), 2
+		if len == 126 then
+			if #b < 4 then return true end
+			len = b:byte(3) * 256 + b:byte(4); off = 4
+		elseif len == 127 then
+			if #b < 10 then return true end
+			local x = { b:byte(3, 10) }
+			if x[1] ~= 0 or x[2] ~= 0 or x[3] ~= 0 or x[4] ~= 0 then return false end
+			len = ((x[5] * 256 + x[6]) * 256 + x[7]) * 256 + x[8]; off = 10
+		end
+		if len > MAXMSG then return false end
+		local need = off + (masked and 4 or 0) + len
+		if #b < need then return true end
+		local payload
+		if masked then
+			local k = { b:byte(off + 1, off + 4) }
+			local raw = b:sub(off + 5, need)
+			local t = {}
+			for i = 1, #raw do t[i] = string.char(bxor(raw:byte(i), k[(i - 1) % 4 + 1])) end
+			payload = table.concat(t)
+		else
+			payload = b:sub(off + 1, need)
+		end
+		c.buf = b:sub(need + 1)
+		local fin = band(b1, 128) ~= 0
+		if op == 8 then
+			sendall(c.sock, frame(8, "")); return false
+		elseif op == 9 then
+			sendall(c.sock, frame(10, payload))
+		elseif op == 1 or op == 2 or op == 0 then
+			if op ~= 0 then c.fop = op; c.msg = payload else c.msg = (c.msg or "") .. payload end
+			if #c.msg > MAXMSG then return false end
+			if fin then
+				local m, o = c.msg, c.fop
+				c.msg = nil
+				if o == 2 then
+					sendall(c.sock, frame(1, json.stringify({ error = "不支持二进制消息" })))
+				else
+					local ok, e = pcall(handle, c, m)
+					if not ok then io.stderr:write("fm350ws: ", tostring(e), "\n"); reply(c, nil, tostring(e)) end
+				end
+			end
+		end
+	end
+end
+
+local function handshake(c)
+	local hdr = c.buf:match("^(.-)\r\n\r\n")
+	if not hdr then return #c.buf < 8192 end
+	c.buf = c.buf:sub(#hdr + 5)
+	local key = hdr:match("[Ss]ec%-[Ww]eb[Ss]ocket%-[Kk]ey:%s*([%w%+/=]+)")
+	if not key then
+		sendall(c.sock, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return false
+	end
+	sendall(c.sock, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " ..
+		accept_key(key) .. "\r\n\r\n")
+	c.ws = true
+	return true
+end
+
+-- ---------- 主循环 ----------
+lsock = nixio.bind(HOST, PORT, "inet", "stream")
+if not lsock then io.stderr:write("fm350ws: 绑定 ", HOST, ":", PORT, " 失败\n"); os.exit(1) end
+lsock:setopt("socket", "reuseaddr", 1)
+lsock:listen(16)
+
+local IN = nixio.poll_flags("in")
+
+local function drop(i)
+	pcall(function() clients[i].sock:close() end)
+	table.remove(clients, i)
+end
+
+while true do
+	local pl = { { fd = lsock, events = IN } }
+	for i, c in ipairs(clients) do pl[i + 1] = { fd = c.sock, events = IN } end
+	local n = nixio.poll(pl, 30000)
+	if n and n > 0 then
+		if pl[1].revents ~= 0 then
+			local s = lsock:accept()
+			if s then
+				s:setopt("socket", "sndtimeo", 5)
+				if #clients >= MAXCLI then drop(1) end
+				clients[#clients + 1] = { sock = s, buf = "", ws = false }
+			end
+		end
+		for i = #clients, 1, -1 do
+			local c, p = clients[i], pl[i + 1]
+			if p and p.revents ~= 0 then
+				local d = c.sock:recv(65536)
+				local keep = false
+				if d and #d > 0 then
+					c.buf = c.buf .. d
+					local ok, r = pcall(function()
+						if not c.ws and not handshake(c) then return false end
+						if c.ws then return pump(c) end
+						return true
+					end)
+					keep = ok and r
+					if not ok then io.stderr:write("fm350ws: ", tostring(r), "\n") end
+				end
+				if not keep then drop(i) end
+			end
+		end
+	end
+end

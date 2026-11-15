@@ -1,0 +1,478 @@
+#!/bin/sh
+# 故障报修通道(s152)：用户在「Mwrt设定 -> 故障报修」主动点按钮才会启用。
+#   apply  生成 12 小时有效的报修码，并拉起 frpc 主动连到更新服务器
+#   stop   结束报修：断开连接并作废报修码
+#   status 输出 JSON(给页面轮询)
+#   run    procd 常驻入口(用户不要直接调用)
+#   chat-send <cid>  在线聊天发消息(文本从标准输入读，不经命令行；输出服务器 JSON)
+#   chat-ack <id>    在线聊天已读回执(给 LuCI 控制器调用)
+# 设计要点：
+#  * 全程由设备主动向外连(不开任何入站端口)，连的是更新服务器的 frps 控制端口；
+#  * frps 只放行"维护人员已在后台输入、且未过期"的报修码，没人输入就连不上；
+#  * 报修码 12 小时后自动失效，到期本脚本自己停掉 frpc 并清状态；
+#  * 服务器证书用内置 CA(/etc/mwrt/ota-ca.pem) 校验，防止报修码被中间人截获；
+#  * 在线聊天(s154)：放行后常驻一个长轮询 worker(sh+curl)，与 frpc 同生命周期；
+#    消息落在 $RUN/chat.*，日志里不记录任何消息内容。
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# 下面几个 MWRT_REPAIR_* 环境变量只给本机自测用(指向假服务器/临时目录)，设备上不设置，行为不变
+STATE_DIR=${MWRT_REPAIR_STATE_DIR:-/etc/mwrt-repair}
+STATE=$STATE_DIR/state
+RUN=${MWRT_REPAIR_RUN:-/tmp/mwrt-repair}
+CHK=$RUN/check
+LOG=$RUN/frpc.log
+CONF=$RUN/frpc.toml
+CA=${MWRT_REPAIR_CA:-/etc/mwrt/ota-ca.pem}
+FRPC=${MWRT_REPAIR_FRPC:-/usr/bin/frpc}
+# 在线聊天的落盘文件(LuCI 控制器只读 jsonl/poll)
+CHAT_JSONL=$RUN/chat.jsonl
+CHAT_POLL=$RUN/chat.poll
+CHAT_LAST=$RUN/chat.last
+CHAT_ACK=$RUN/chat.ack
+CHAT_PID=$RUN/chat.pid
+CHAT_CURL=$RUN/chat.curl
+CHAT_OUT=$RUN/chat.out
+CHAT_LINE=$RUN/chat.line
+TTL=43200
+DEF_HOST=mwrt.manper.me
+DEF_PORT=15156
+
+mkdir -p "$RUN" 2>/dev/null
+chmod 700 "$RUN" 2>/dev/null
+
+srv_host() {
+	local s
+	s=$(uci -q get mwrt_ota.main.server 2>/dev/null)
+	s=${s#https://}; s=${s%%/*}; s=${s%%:*}
+	[ -n "$s" ] || s=$DEF_HOST
+	echo "$s"
+}
+
+srv_port() {
+	local p
+	p=$(uci -q get mwrt_ota.main.repair_port 2>/dev/null)
+	case "$p" in ''|*[!0-9]*) p=$DEF_PORT ;; esac
+	echo "$p"
+}
+
+srv_url() {
+	local s
+	[ -n "$MWRT_REPAIR_URL" ] && { echo "${MWRT_REPAIR_URL%/}"; return; }
+	s=$(uci -q get mwrt_ota.main.server 2>/dev/null)
+	case "$s" in https://*) ;; *) s=https://$DEF_HOST:15155 ;; esac
+	echo "${s%/}"
+}
+
+# 问更新服务器：维护人员有没有放行这个报修码。输出 approved / pending / ended / nonet
+# 这一步只是一次很轻的 HTTPS 请求，放行之前设备上不会有 frpc 进程。
+check_code() {
+	local out st
+	out=$(curl -sS --cacert "$CA" -m 10 --data-urlencode "code=$CODE" "$(srv_url)/api/v1/repair/check" 2>/dev/null)
+	st=$(printf '%s' "$out" | sed -n 's/.*"state": *"\([a-z]*\)".*/\1/p' | head -n1)
+	case "$st" in approved|pending|ended) echo "$st" ;; *) echo nonet ;; esac
+}
+
+# 报修码 8 位，去掉容易看错的 I O 0 1，显示时写成 XXXX-XXXX
+gen_code() {
+	head -c 256 /dev/urandom | tr -dc 'A-HJ-NP-Z2-9' | head -c 8
+}
+
+# 由报修码推出服务器上的映射端口：基准端口 26000 起每 4 个一组(ssh / http / https)，
+# 服务器端按同一公式校验，设备想映射别的端口会被拒绝。
+base_port() {
+	local h
+	h=$(printf '%s' "$1" | md5sum | cut -c1-6)
+	echo $((26000 + ($(printf '%d' "0x$h") % 240) * 4))
+}
+
+load_state() {
+	CODE=; EXP=; SINCE=
+	[ -s "$STATE" ] || return 1
+	CODE=$(sed -n 's/^code=//p' "$STATE" | head -n1)
+	EXP=$(sed -n 's/^exp=//p' "$STATE" | head -n1)
+	SINCE=$(sed -n 's/^since=//p' "$STATE" | head -n1)
+	case "$CODE" in ????????) ;; *) return 1 ;; esac
+	case "$EXP" in ''|*[!0-9]*) return 1 ;; esac
+	return 0
+}
+
+clear_state() {
+	rm -f "$STATE" "$CONF" "$CHK" 2>/dev/null
+}
+
+devid() {
+	local m
+	m=$(cat /sys/class/net/br-lan/address 2>/dev/null | tr -d ':')
+	[ -n "$m" ] || m=unknown
+	echo "d$m"
+}
+
+# dropbear 默认只听 LAN 地址(Interface=lan)，映射 SSH 要连 LAN 口地址而不是 127.0.0.1
+lan_ip() {
+	local a
+	a=$(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}' | head -n1)
+	a=${a%%/*}
+	[ -n "$a" ] || a=127.0.0.1
+	echo "$a"
+}
+
+# 模组网页后台的 WebSocket 端口: 5700 走 webuiserver(8765)，其余(FM350/RM520)走 fm350webserver.py(8766)。
+# 远程窗口里设备网页的 ws 经这个映射口桥接(服务器侧 /_devws)。
+ws_port() {
+	if pidof webuiserver >/dev/null 2>&1; then echo 8765; else echo 8766; fi
+}
+
+mkconf() {
+	local host port base id board lan wsp
+	lan=$(lan_ip)
+	wsp=$(ws_port)
+	host=$(srv_host); port=$(srv_port); base=$(base_port "$CODE"); id=$(devid)
+	board=$(cat /tmp/sysinfo/board_name 2>/dev/null | tr -c 'A-Za-z0-9,_-' '_')
+	umask 077
+	cat > "$CONF" <<EOF
+serverAddr = "$host"
+serverPort = $port
+user = "$id"
+loginFailExit = true
+metadatas = { code = "$CODE", board = "$board" }
+log.to = "$LOG"
+log.level = "info"
+log.maxDays = 1
+transport.tls.enable = true
+transport.tls.trustedCaFile = "$CA"
+transport.tls.serverName = "$host"
+transport.poolCount = 0
+
+[[proxies]]
+name = "ssh-$CODE"
+type = "tcp"
+localIP = "$lan"
+localPort = 22
+remotePort = $base
+
+[[proxies]]
+name = "http-$CODE"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 80
+remotePort = $((base + 1))
+
+# frps 每台设备最多映射 3 个端口: ssh / http(远程窗口只代理 80 口,不再映射 443) / ws(模组网页后台)
+[[proxies]]
+name = "ws-$CODE"
+type = "tcp"
+localIP = "$lan"
+localPort = $wsp
+remotePort = $((base + 3))
+EOF
+}
+
+fmt_code() {
+	printf '%s-%s' "$(echo "$1" | cut -c1-4)" "$(echo "$1" | cut -c5-8)"
+}
+
+json_status() {
+	local st=idle rem=0 code= conn=false run=false now err=
+	now=$(date +%s)
+	if load_state; then
+		rem=$((EXP - now))
+		if [ "$rem" -le 0 ]; then
+			st=expired; rem=0
+		else
+			st=active; code=$(fmt_code "$CODE")
+		fi
+	fi
+	pgrep frpc >/dev/null 2>&1 && run=true
+	if [ "$st" = active ] && [ "$run" = true ] && [ -f "$LOG" ]; then
+		# 只看最近的日志：登录成功且之后没有掉线/被拒
+		local last
+		last=$(grep -E 'login to server success|login to the server failed|connect to server error|control connection closed|start proxy success|proxy start error|报修码无效' "$LOG" 2>/dev/null | tail -n 1)
+		case "$last" in
+			*'login to server success'*|*'start proxy success'*) conn=true ;;
+		esac
+		case "$last" in
+			*'login to the server failed'*|*'报修码无效'*) err=denied ;;
+			*'connect to server error'*) err=nonet ;;
+		esac
+	fi
+	# 还没放行时没有 frpc，网络不通就在这里提示
+	if [ "$st" = active ] && [ "$run" != true ] && [ "$(cat "$CHK" 2>/dev/null)" = nonet ]; then err=nonet; fi
+	[ -x "$FRPC" ] || err=no_frpc
+	printf '{"ok":true,"state":"%s","code":"%s","remain":%d,"running":%s,"connected":%s,"error":"%s","ttl":%d}\n' \
+		"$st" "$code" "$rem" "$run" "$conn" "$err" "$TTL"
+}
+
+do_stop() {
+	/etc/init.d/mwrt-repair stop >/dev/null 2>&1
+	killall frpc 2>/dev/null
+	stop_chat
+	clear_state
+	: > "$LOG" 2>/dev/null
+}
+
+do_apply() {
+	if [ ! -x "$FRPC" ]; then
+		echo '{"ok":false,"error":"no_frpc"}'; return 1
+	fi
+	# 限频：10 秒内不重复申请，防止连点
+	local now last
+	now=$(date +%s)
+	last=$(cat "$RUN/last.apply" 2>/dev/null)
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	if [ $((now - last)) -lt 10 ] && [ "$now" -ge "$last" ]; then
+		echo '{"ok":false,"error":"busy"}'; return 1
+	fi
+	echo "$now" > "$RUN/last.apply"
+	do_stop
+	# 新申请才清空上一次的聊天记录(结束后的历史要留到这一刻)
+	rm -f "$RUN"/chat.* 2>/dev/null
+	mkdir -p "$STATE_DIR"
+	local code
+	code=$(gen_code)
+	[ ${#code} -eq 8 ] || { echo '{"ok":false,"error":"gen"}'; return 1; }
+	umask 077
+	printf 'code=%s\nexp=%d\nsince=%d\n' "$code" $((now + TTL)) "$now" > "$STATE"
+	/etc/init.d/mwrt-repair start >/dev/null 2>&1
+	logger -t mwrt-repair "用户申请故障报修，报修码已生成，有效期 12 小时"
+	json_status
+}
+
+stop_frpc() {
+	[ -n "$FP" ] && kill "$FP" 2>/dev/null
+	killall frpc 2>/dev/null
+	FP=
+}
+
+frpc_alive() {
+	[ -n "$FP" ] && kill -0 "$FP" 2>/dev/null
+}
+
+# ---- 在线聊天(s154) -------------------------------------------------------------
+# 放行后常驻一个 worker：对服务器做长轮询(服务器端最多挂 20 秒)，新消息整行追加到 chat.jsonl，
+# 最近一次响应(含对端在线/已读)覆盖写入 chat.poll，已拿到的最大消息 id 记在 chat.last。
+# LuCI 控制器只读这几个文件，所以页面轮询是纯本地读取、毫秒级。
+# 日志(logger)里只记"通道建立/关闭"，不记任何消息内容。
+
+num_or_zero() {
+	case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac
+}
+
+# 判断 pid 对应进程的命令行里是否含某个关键字，防止 pid 被复用后误杀别的进程。
+# 不用 pgrep -f：它会匹配到调用者自己所在的 sh -c 命令行(见 _rt66 的坑)。
+pid_is() {
+	[ -n "$1" ] && [ -r "/proc/$1/cmdline" ] || return 1
+	tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "$2"
+}
+
+chat_alive() {
+	[ -n "$CP" ] && kill -0 "$CP" 2>/dev/null
+}
+
+# 结束聊天 worker 及其 curl 子进程(worker 自己的 TERM 陷阱也会清 curl，这里再兜一层)
+stop_chat() {
+	local p c
+	p=$CP
+	[ -n "$p" ] || p=$(cat "$CHAT_PID" 2>/dev/null)
+	pid_is "$p" mwrt-repair && kill "$p" 2>/dev/null
+	c=$(cat "$CHAT_CURL" 2>/dev/null)
+	pid_is "$c" curl && kill "$c" 2>/dev/null
+	rm -f "$CHAT_PID" "$CHAT_CURL" 2>/dev/null
+	CP=
+}
+
+start_chat() {
+	chat_worker &
+	CP=$!
+	echo "$CP" > "$CHAT_PID"
+	logger -t mwrt-repair "在线聊天通道已建立"
+}
+
+# worker 里可被 TERM 打断的睡眠(前台 sleep 会让陷阱等到睡醒才执行)
+chat_nap() {
+	sleep "$1" &
+	CC=$!
+	wait "$CC"
+	CC=
+}
+
+# 向服务器拉一次。参数: 服务器地址 等待秒数 上次 ver。
+# 服务器回了 ok:true 返回 0，并设置 R_ST(state)、R_MSGS(本次是否带新消息 0/1)、V(新 ver)；
+# 网络失败或服务器回错误返回 1。
+chat_poll_once() {
+	local n a rc nl nv sz
+	n=$(num_or_zero "$(cat "$CHAT_LAST" 2>/dev/null)")
+	a=$(num_or_zero "$(cat "$CHAT_ACK" 2>/dev/null)")
+	rm -f "$CHAT_OUT"
+	curl -sS --cacert "$CA" -m $(($2 + 12)) -o "$CHAT_OUT" \
+		--data-urlencode "code=$CODE" --data-urlencode "ver=$3" \
+		-d "since=$n" -d "wait=$2" -d "ack=$a" "$1/api/v1/repair/chat/poll" 2>/dev/null &
+	CC=$!
+	echo "$CC" > "$CHAT_CURL"
+	wait "$CC"
+	rc=$?
+	CC=
+	rm -f "$CHAT_CURL"
+	[ "$rc" -eq 0 ] || return 1
+	# 压成一行(JSON 里的换行都已转义，这里只是去掉服务器可能带的格式换行)
+	{ tr -d '\r\n' < "$CHAT_OUT"; printf '\n'; } > "$CHAT_LINE" 2>/dev/null
+	grep -Eq '"ok": *true' "$CHAT_LINE" || return 1
+	R_ST=$(sed -n 's/.*"state": *"\([a-z]*\)".*/\1/p' "$CHAT_LINE" | head -n1)
+	nv=$(sed -n 's/.*"ver": *"\([^"]*\)".*/\1/p' "$CHAT_LINE" | head -n1)
+	nl=$(sed -n 's/.*"last": *\([0-9][0-9]*\).*/\1/p' "$CHAT_LINE" | head -n1)
+	R_MSGS=0
+	if grep -Eq '"msgs": *\[ *\{' "$CHAT_LINE"; then
+		R_MSGS=1
+		# 先落消息再推进 last：中途被杀最多重复拉一次，控制器按 id 去重
+		cat "$CHAT_LINE" >> "$CHAT_JSONL"
+		set -- $(wc -c < "$CHAT_JSONL" 2>/dev/null)
+		sz=$(num_or_zero "$1")
+		if [ "$sz" -gt 65536 ]; then
+			tail -n 100 "$CHAT_JSONL" > "$CHAT_JSONL.tmp" && mv -f "$CHAT_JSONL.tmp" "$CHAT_JSONL"
+			# 一行就是一次 poll 的整段响应(最多 100 条长消息)，光限行数压不住体积；
+			# 再按字节封顶，保证最近的消息始终落在控制器读取窗口(512KB)内。
+			# 截断后丢掉半行；若连整行都超(丢完为空)就只留最后一行。
+			set -- $(wc -c < "$CHAT_JSONL" 2>/dev/null)
+			sz=$(num_or_zero "$1")
+			if [ "$sz" -gt 393216 ]; then
+				tail -c 393216 "$CHAT_JSONL" | sed 1d > "$CHAT_JSONL.tmp"
+				[ -s "$CHAT_JSONL.tmp" ] || tail -n 1 "$CHAT_JSONL" > "$CHAT_JSONL.tmp"
+				mv -f "$CHAT_JSONL.tmp" "$CHAT_JSONL"
+			fi
+		fi
+	fi
+	[ -n "$nl" ] && echo "$nl" > "$CHAT_LAST"
+	cp "$CHAT_LINE" "$CHAT_POLL.tmp" 2>/dev/null && mv -f "$CHAT_POLL.tmp" "$CHAT_POLL"
+	V=$nv
+	return 0
+}
+
+# 聊天 worker：在 do_run 的子 shell 里跑，只在维护人员放行后存在。
+chat_worker() {
+	local mycode url t0 oldv
+	mycode=$CODE
+	CC=
+	V=
+	trap 'kill $CC 2>/dev/null; rm -f "$CHAT_CURL" "$CHAT_PID"; exit 0' TERM INT HUP
+	url=$(srv_url)
+	while :; do
+		# 爹(do_run)没了、报修码换了或过期，worker 自己退出，不留孤儿
+		kill -0 $$ 2>/dev/null || exit 0
+		load_state || exit 0
+		[ "$CODE" = "$mycode" ] || exit 0
+		[ "$EXP" -gt "$(date +%s)" ] || exit 0
+		t0=$(date +%s)
+		oldv=$V
+		if ! chat_poll_once "$url" 20 "$V"; then
+			chat_nap 5
+			continue
+		fi
+		if [ "$R_ST" = ended ]; then
+			rm -f "$CHAT_PID"
+			exit 0
+		fi
+		# 服务器立刻返回且什么都没变(例如 pending、或服务器等待名额已满)时歇一下，避免忙等
+		if [ "$R_MSGS" = 0 ] && [ "$V" = "$oldv" ] && [ "$(date +%s)" -le $((t0 + 1)) ]; then
+			chat_nap 2
+		fi
+	done
+}
+
+# 发消息：chat-send <cid>，文本从标准输入读(不进命令行，不进日志)，输出服务器 JSON。
+# 文本交给 curl 的 --data-urlencode text@-，任意字符(引号/反斜杠/$/反引号/%/中文/换行)都由 curl 编码。
+do_chat_send() {
+	local cid=$1 out
+	case "$cid" in ''|*[!A-Za-z0-9_-]*) cat >/dev/null; echo '{"ok":false,"error":"cid"}'; return 1 ;; esac
+	if [ ${#cid} -lt 8 ] || [ ${#cid} -gt 32 ]; then
+		cat >/dev/null; echo '{"ok":false,"error":"cid"}'; return 1
+	fi
+	if ! load_state || [ "$EXP" -le "$(date +%s)" ]; then
+		cat >/dev/null; echo '{"ok":false,"error":"nocode"}'; return 1
+	fi
+	# 最多读 4096 字节：500 个字符(含 4 字节的)也装得下，再多的交给服务器判 toolong
+	out=$(head -c 4096 | curl -sS --cacert "$CA" -m 15 \
+		--data-urlencode "code=$CODE" --data-urlencode "cid=$cid" --data-urlencode "text@-" \
+		"$(srv_url)/api/v1/repair/chat/send" 2>/dev/null)
+	if printf '%s' "$out" | grep -Eq '"ok": *(true|false)'; then
+		printf '%s\n' "$out"
+	else
+		echo '{"ok":false,"error":"nonet"}'; return 1
+	fi
+}
+
+# 已读回执：chat-ack <id>。id 只升不降，写进 chat.ack(worker 下次轮询也会带上)，并后台立刻发一次。
+do_chat_ack() {
+	local id=$1 cur
+	case "$id" in ''|0*|*[!0-9]*) echo '{"ok":false,"error":"id"}'; return 1 ;; esac
+	[ ${#id} -le 12 ] || { echo '{"ok":false,"error":"id"}'; return 1; }
+	load_state || { echo '{"ok":false,"error":"nocode"}'; return 1; }
+	cur=$(num_or_zero "$(cat "$CHAT_ACK" 2>/dev/null)")
+	if [ "$id" -gt "$cur" ]; then
+		echo "$id" > "$CHAT_ACK"
+		# 必须断开标准输出/错误，否则 LuCI 的 popen 会一直等这个后台进程
+		( curl -sS --cacert "$CA" -m 10 --data-urlencode "code=$CODE" -d "id=$id" \
+			"$(srv_url)/api/v1/repair/chat/ack" ) >/dev/null 2>&1 </dev/null &
+	fi
+	echo '{"ok":true}'
+}
+
+# procd 常驻：只是一个很轻的 shell 轮询，不占内存。
+#   维护人员没放行 -> 不启动 frpc；
+#   放行后才启动 frpc(断了 20 秒内拉起)；
+#   维护人员撤销 / 用户结束 / 12 小时到期 -> 立刻结束 frpc 并清理，自己退出。
+do_run() {
+	FP=
+	CP=
+	trap 'stop_frpc; stop_chat; exit 0' TERM INT
+	while :; do
+		load_state || { stop_frpc; stop_chat; exit 0; }
+		local now rem r w p
+		now=$(date +%s)
+		rem=$((EXP - now))
+		if [ "$rem" -le 0 ]; then
+			stop_frpc; stop_chat; clear_state
+			logger -t mwrt-repair "报修码已过期，通道已关闭"
+			exit 0
+		fi
+		r=$(check_code)
+		echo "$r" > "$CHK"
+		case "$r" in
+			ended)
+				# 聊天 worker 还在就先停掉，再补拉一次，保证"已结束"的系统消息也落到本地
+				p=$CP
+				if chat_alive; then
+					stop_chat; wait "$p" 2>/dev/null
+					V=
+					chat_poll_once "$(srv_url)" 0 ""
+				fi
+				stop_frpc; stop_chat; clear_state
+				logger -t mwrt-repair "维护人员已结束报修，通道已关闭"
+				exit 0 ;;
+			approved)
+				if ! frpc_alive; then
+					mkconf
+					timeout "$rem" "$FRPC" -c "$CONF" >/dev/null 2>&1 &
+					FP=$!
+					logger -t mwrt-repair "维护人员已确认，正在建立通道"
+				fi
+				chat_alive || start_chat
+				w=20 ;;
+			pending)
+				frpc_alive && stop_frpc
+				chat_alive && stop_chat
+				w=8 ;;
+			*) w=15 ;;
+		esac
+		sleep "$w" &
+		wait $!
+	done
+}
+
+case "$1" in
+	apply)  do_apply ;;
+	stop)   do_stop; logger -t mwrt-repair "报修通道已结束"; json_status ;;
+	status) json_status ;;
+	run)    do_run ;;
+	chat-send) do_chat_send "$2" ;;
+	chat-ack)  do_chat_ack "$2" ;;
+	*)      echo "用法: $0 apply|stop|status|chat-send <cid>|chat-ack <id>" >&2; exit 2 ;;
+esac

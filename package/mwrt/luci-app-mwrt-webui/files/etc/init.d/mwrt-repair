@@ -1,0 +1,18 @@
+#!/bin/sh /etc/rc.common
+# 故障报修通道(s152)。只有用户在页面申请过(存在未过期的报修码)才会真正启动。
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	[ -s /etc/mwrt-repair/state ] || return 0
+	procd_open_instance
+	procd_set_param command /usr/libexec/mwrt-repair run
+	procd_set_param stdout 0
+	procd_set_param stderr 0
+	procd_close_instance
+}
+
+stop_service() {
+	killall frpc 2>/dev/null
+}

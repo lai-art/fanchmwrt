@@ -1,0 +1,997 @@
+#!/bin/sh
+# /usr/bin/mwrt-usbnic —— USB 网卡 / 手机数据线共享(RNDIS、iPhone)的插拔处理
+#
+# 没有常驻进程。触发源只有:
+#   /etc/hotplug.d/net/30-mwrt-usbnic   网口 add / remove 时调 plug / unplug
+#   /etc/init.d/mwrt-usbnic             开机调 boot;mwrt 配置改动(USB网口检测开关)调 sync
+#   控制器 modem.lua                    usbnic_set / usbnic_ignore 调 set / ignore,usbnic_state 偶尔调 state
+#   超时定时器                          nic 接入后起的短命后台子进程,到点调 expire(拔出时取消)
+# 事件来了才跑,跑完就退出。
+#
+# 用法:
+#   plug <dev>                     网口出现(hotplug add / 补扫)
+#   unplug <dev>                   网口消失(hotplug remove)
+#   set <dev> lan|wan [参数文件]   用户的选择;wan 的参数文件见下;成功打印 OK,失败打印 ERR:中文原因 并退出 1
+#   ignore <dev>                   弹窗里点了忽略:pending 的按 LAN 处理,其余不动
+#   expire <dev> <ts>              定时器到点:仍是 pending 且 ts 对得上就按 LAN 处理
+#   rescan                         把 /sys 里现有的设备和记录对一遍(补处理已插着的、清掉已不在的)
+#   sync                           USB网口检测开关变了:开 -> rescan,关 -> 清掉已建立的配置并恢复网关存活
+#   boot                           开机:先清掉上次留在 flash 里的残留配置,再 rescan
+#   state                          对账后输出 /tmp/mwrt-usbnic.json
+# 参数文件(控制器写,一行一个 键=值,用完即删): proto username password ipaddr netmask gateway dns
+#
+# 设备分类(classify):
+#   /sys/class/net/<dev>/device 的真实路径在 USB 总线下(.../usbN/...)、是以太网类型、
+#   不是无线,按驱动分: rndis_host / ipheth => tether;
+#   r8152 / ax88179_178a / asix / cdc_ether / cdc_ncm / ... => nic;其他驱动不管。
+#   蜂窝模组一律排除(模组的 RNDIS/ECM 口不是网卡也不是手机),四层判据见 is_modem。
+#   nic 驱动清单在 mwrt-usbinfo 里还有一份(首页设备图用),两处必须同改。
+#
+# 状态收敛:plug 和 unplug 都只是把"此刻 sysfs 里的真相"和"记录"对一遍(reconcile),
+# 所以重复 add、remove 后又 add、两个事件乱序,结果都一样。
+#
+# 保存的东西:
+#   /tmp/mwrt-usbnic.d/<dev>        每个设备一份记录(键=值),/tmp/mwrt-usbnic.json 由它们生成
+#   /etc/mwrt-usbnic.save           (flash)网关存活原值 base.*、占用者栈 own.<dev>=<primary_if>、
+#                                   放进了网桥的口 lan.<dev>;重启后靠它恢复
+#   network 里本脚本建的接口带 option mwrt_usbnic '1',开机清扫靠这个标记认。
+#
+# 测试用环境变量(板上都不设,走默认值): USBNIC_SYS USBNIC_RUN USBNIC_PERSIST USBNIC_UCI_CONF
+#   USBNIC_UCI_SAVE USBNIC_USBINFO USBNIC_MODEM_RULE USBNIC_IP USBNIC_UBUS USBNIC_NETRELOAD
+#   USBNIC_FWRELOAD USBNIC_TIMEOUT USBNIC_SYNC USBNIC_RMWAIT
+
+SYS=${USBNIC_SYS:-/sys}
+RUN=${USBNIC_RUN:-/tmp}
+PERSIST=${USBNIC_PERSIST:-/etc}
+USBINFO=${USBNIC_USBINFO:-/usr/libexec/mwrt-usbinfo}
+MODEM_RULE=${USBNIC_MODEM_RULE:-/usr/share/qmodem/modem_port_rule.json}
+IPC=${USBNIC_IP:-ip}
+UBUS=${USBNIC_UBUS:-ubus}
+NETRELOAD=${USBNIC_NETRELOAD:-/etc/init.d/network reload}
+FWRELOAD=${USBNIC_FWRELOAD:-/etc/init.d/firewall reload}
+TIMEOUT=${USBNIC_TIMEOUT:-60}       # nic 接入后等用户选择的秒数,到点按 LAN
+RMWAIT=${USBNIC_RMWAIT:-3}          # remove 事件到来时,最多等多少秒让 sysfs 里的口消失
+SYNC=${USBNIC_SYNC:-0}              # 1=网络重载同步执行(测试用)
+
+DIR=$RUN/mwrt-usbnic.d
+JSON=$RUN/mwrt-usbnic.json
+EVENT=$RUN/mwrt-port.event
+EVLOCK=$RUN/mwrt-port.lock          # 与 luci.mwrt-notice 的 PORT_LOCK 同一个
+LOCKF=$RUN/mwrt-usbnic.lock
+APPLYQ=$RUN/mwrt-usbnic.apply
+SAVE=$PERSIST/mwrt-usbnic.save
+# USB 口 WAN 的默认路由 metric: 夹在有线 WAN(0)和蜂窝(11)之间。netifd 装路由用 REPLACE,
+# 同为 metric 0 会和有线口互相顶替; 显式 5 之后,谁在用由网关存活的 metric 0 切换决定
+# (手机口没通数据时守护进程探不通,出口留在有线口)。
+WAN_METRIC=5
+EVENT_TTL=150                       # 与 luci.mwrt-notice 的 PORT_EVENT_TTL 相同
+
+SELF=$0
+case "$SELF" in /*) ;; *) SELF=/usr/bin/mwrt-usbnic ;; esac
+
+# 改动标记,finish 时按它提交 uci、重载网络
+D_NET=0; D_FW=0; D_FO=0; D_RT=0
+ERRMSG=""
+
+# ---------------------------------------------------------------- 基础工具
+
+U() {
+	if [ -n "$USBNIC_UCI_CONF" ]; then
+		uci -c "$USBNIC_UCI_CONF" -p "${USBNIC_UCI_SAVE:-$RUN/mwrt-usbnic.uci}" "$@"
+	else
+		uci "$@"
+	fi
+}
+
+now() { date +%s; }
+# 单调时钟(开机秒数)。本机没有 RTC, 开机后 NTP 会把挂钟一步跳到现在, 所以 pending 的"到点"只能按它算, 不能按挂钟
+mono() { local u _; read -r u _ < "${USBNIC_UPTIME:-/proc/uptime}" 2>/dev/null; u=${u%%.*}; case "$u" in ''|*[!0-9]*) u=0 ;; esac; echo "$u"; }
+
+# 进 JSON / 事件 / 记录文件的文字: 删控制字符、竖线、引号、反斜杠、$、反引号
+clean() { printf '%s' "$1" | tr -d '\000-\037\177|\\"$`'; }
+
+valid_dev() {
+	case "$1" in ''|.*|-*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+	[ "${#1}" -le 15 ]
+}
+
+usben() { [ "$(U -q get 'mwrt.@ndis[0].USBEN' 2>/dev/null)" = 1 ]; }
+
+log() { logger -t mwrt-usbnic "$*" 2>/dev/null; }
+
+# 接口段名: usbwan_<口名,非字母数字换成下划线>
+secname() { printf 'usbwan_%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
+# pppoe 拨号接口名不能超过 15 个字符,段名带前缀放不下,显式指定: pppoe-<口名最后 9 位字母数字>
+pppname() { printf 'pppoe-%s' "$(printf '%s' "$1" | tr -cd 'A-Za-z0-9' | tail -c 9)"; }
+
+# ---------------------------------------------------------------- 记录(每设备一份,键=值)
+
+R_kind=; R_name=; R_vid=; R_pid=; R_drv=; R_bus=; R_id=; R_role=; R_proto=; R_ts=; R_deadline=; R_dmono=; R_sec=; R_pif=
+
+rec_load() {
+	local l k v
+	R_kind=; R_name=; R_vid=; R_pid=; R_drv=; R_bus=; R_id=; R_role=; R_proto=; R_ts=; R_deadline=; R_dmono=; R_sec=; R_pif=
+	[ -f "$DIR/$1" ] || return 1
+	while IFS= read -r l; do
+		k=${l%%=*}; v=${l#*=}
+		case "$k" in
+			kind) R_kind=$v ;; name) R_name=$v ;; vid) R_vid=$v ;; pid) R_pid=$v ;;
+			drv) R_drv=$v ;; bus) R_bus=$v ;; id) R_id=$v ;; role) R_role=$v ;;
+			proto) R_proto=$v ;; ts) R_ts=$v ;; deadline) R_deadline=$v ;; dmono) R_dmono=$v ;;
+			sec) R_sec=$v ;; pif) R_pif=$v ;;
+		esac
+	done < "$DIR/$1"
+	return 0
+}
+
+rec_save() {
+	mkdir -p "$DIR"
+	{
+		echo "kind=$R_kind"; echo "name=$R_name"; echo "vid=$R_vid"; echo "pid=$R_pid"
+		echo "drv=$R_drv"; echo "bus=$R_bus"; echo "id=$R_id"; echo "role=$R_role"
+		echo "proto=$R_proto"; echo "ts=$R_ts"; echo "deadline=$R_deadline"; echo "dmono=$R_dmono"
+		echo "sec=$R_sec"; echo "pif=$R_pif"
+	} > "$DIR/$1.tmp" && mv -f "$DIR/$1.tmp" "$DIR/$1"
+}
+
+# 当前所有记录的设备名(不含 .pid / .tmp)
+rec_list() {
+	local f
+	for f in "$DIR"/*; do
+		[ -f "$f" ] || continue
+		case "${f##*/}" in *.pid|*.tmp) continue ;; esac
+		echo "${f##*/}"
+	done
+}
+
+# ---------------------------------------------------------------- flash 里的存档
+
+save_get() {
+	[ -f "$SAVE" ] || return 0
+	awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$SAVE"
+}
+save_del() {
+	[ -f "$SAVE" ] || return 0
+	awk -F= -v k="$1" '$1 != k' "$SAVE" > "$SAVE.tmp" 2>/dev/null
+	if [ -s "$SAVE.tmp" ]; then mv -f "$SAVE.tmp" "$SAVE"; else rm -f "$SAVE.tmp" "$SAVE"; fi
+}
+save_set() {
+	save_del "$1"
+	mkdir -p "$PERSIST"
+	{ [ -f "$SAVE" ] && cat "$SAVE"; echo "$1=$2"; } > "$SAVE.tmp" && mv -f "$SAVE.tmp" "$SAVE"
+}
+# 网关存活原值 base.<选项> 除了写 flash 存档,还镜像进 Mwrt-Assurance 自己的 uci 选项
+# usbnic_base_<选项>: 升级/OTA 若保留了被我们改过的 Mwrt-Assurance,镜像随它一起保留,
+# 存档丢了也能还原; 若没保留配置,镜像随之消失,不会把旧值写进全新的默认配置。
+# 读先看存档,没有再看镜像。(FA 在下面的网关存活一节定义,函数调用时才展开)
+base_get() {
+	local v
+	v=$(save_get "base.$1")
+	[ -n "$v" ] || v=$(U -q get "$FA.usbnic_base_$1" 2>/dev/null)
+	printf '%s' "$v"
+}
+base_set() {
+	save_set "base.$1" "$2"
+	U set "$FA.usbnic_base_$1=$2" && D_FO=1
+}
+base_del() {
+	save_del "base.$1"
+	if [ -n "$(U -q get "$FA.usbnic_base_$1" 2>/dev/null)" ]; then
+		U -q delete "$FA.usbnic_base_$1"; D_FO=1
+	fi
+}
+# 某个前缀下的所有键(own. / lan.),按文件顺序
+save_keys() {
+	[ -f "$SAVE" ] || return 0
+	awk -F= -v p="$1" 'index($1, p) == 1 { print substr($1, length(p) + 1) }' "$SAVE"
+}
+
+# ---------------------------------------------------------------- 事件(/tmp/mwrt-port.event)
+
+# 行格式 时间戳|类型|接口|标签;同一个接口只留最新一条,过期的顺手清掉(与 luci.mwrt-notice 一致)
+QUIET=0
+ev() {
+	local t l n
+	[ "$QUIET" = 1 ] && return 0
+	t=$(now); l=$(clean "$3")
+	(
+		n=0
+		while ! flock -n 8 2>/dev/null; do
+			n=$((n + 1)); [ "$n" -ge 20 ] && break
+			sleep 1
+		done
+		if [ -s "$EVENT" ]; then
+			awk -F'|' -v k="$2" -v n="$t" -v ttl="$EVENT_TTL" '$3 != k && $1 ~ /^[0-9]+$/ && n - $1 <= ttl' "$EVENT" > "$EVENT.n" 2>/dev/null
+			mv -f "$EVENT.n" "$EVENT"
+		fi
+		echo "$t|$1|$2|$l" >> "$EVENT"
+	) 8>"$EVLOCK"
+}
+
+# ---------------------------------------------------------------- 设备分类
+
+# 读 sysfs 小文件并去掉控制字符; 文件不存在(很多设备没有 manufacturer / serial)不报错
+rdf() { [ -r "$1" ] && tr -d '\000-\037' < "$1" 2>/dev/null; return 0; }
+
+C_kind=; C_name=; C_vid=; C_pid=; C_drv=; C_bus=; C_id=
+
+# 与 mwrt-usbinfo 同一条规则: 有 cdc-wdm(usbmisc)或两个以上 ttyUSB 的 USB 设备是蜂窝模组
+# $1=USB 设备目录。$2=strict 时,有任何串口(ttyUSB/ttyACM)也算(用于 cdc_ether/cdc_ncm,
+# 这两个驱动常被模组的 ECM/NCM 模式用,真网卡没有串口)。
+is_modem_dev() {
+	local dir="$1" strict="$2" b i x ty=0
+	b=${dir##*/}
+	for i in "$dir/$b":*; do
+		[ -d "$i" ] || continue
+		[ -d "$i/usbmisc" ] && return 0
+		for x in "$i"/ttyUSB*; do [ -e "$x" ] && ty=$((ty + 1)); done
+		if [ "$strict" = strict ]; then
+			[ -d "$i/tty" ] && return 0
+		fi
+	done
+	[ "$ty" -ge 2 ] && return 0
+	[ "$strict" = strict ] && [ "$ty" -ge 1 ] && return 0
+	return 1
+}
+
+# 返回 0 且设置 C_* = 这是个该管的 USB 网卡/手机共享口;返回 1 = 不管(含模组)
+classify() {
+	local dev="$1" d real usbdev drv kind top t vid pid prod mfr ser nm
+	d="$SYS/class/net/$dev"
+	[ -e "$d/device" ] || return 1
+	[ -e "$d/wireless" ] && return 1
+	[ -e "$d/phy80211" ] && return 1
+	[ "$(cat "$d/type" 2>/dev/null)" = 1 ] || return 1
+	real=$(readlink -f "$d/device" 2>/dev/null)
+	case "$real" in */usb[0-9]*/*) ;; *) return 1 ;; esac
+	drv=$(readlink "$d/device/driver" 2>/dev/null); drv=${drv##*/}
+	# 驱动清单(mwrt-usbinfo 里还有一份,同改)
+	case "$drv" in
+		rndis_host|ipheth) kind=tether ;;
+		r8152|r8153_ecm|ax88179_178a|ax88172a|asix|cdc_ether|cdc_ncm|cdc_eem|aqc111|lan78xx|smsc95xx|smsc75xx|dm9601|sr9700|mcs7830|pegasus|rtl8150|ch9200|cdc_subset|net1080|plusb|gl620a|catc|kaweth)
+			kind=nic ;;
+		*) return 1 ;;
+	esac
+	# 接口目录(2-1:1.0)的上一级才是 USB 设备
+	usbdev=${real%/*}
+	[ -f "$usbdev/idVendor" ] || return 1
+	vid=$(rdf "$usbdev/idVendor")
+	pid=$(rdf "$usbdev/idProduct")
+	C_bus=${usbdev##*/}
+	top=${C_bus%%.*}
+	# 排除模组。四层,任一命中就不管:
+	# 1) mwrt-usbinfo 判成 modem(按最上层设备的总线位置)
+	if [ -x "$USBINFO" ]; then
+		t=$("$USBINFO" 2>/dev/null | awk -F'|' -v b="$top" '$1 == b { print $5; exit }')
+		[ "$t" = modem ] && return 1
+	fi
+	# 2) qmodem 的已知模组型号表
+	if [ -f "$MODEM_RULE" ] && grep -qiF "\"$vid:$pid\"" "$MODEM_RULE" 2>/dev/null; then
+		return 1
+	fi
+	# 3) 这个口已经被 qmodem 当模组数据口登记了(network 里带 modem_config)
+	if U -q show network 2>/dev/null | tr -d "'" | awk -F= -v dev="$dev" '
+		{ split($1, a, "."); if (a[3] == "device") dv[a[2]] = $2; else if (a[3] == "modem_config") mc[a[2]] = 1 }
+		END { for (k in mc) if (dv[k] == dev) exit 0; exit 1 }'; then
+		return 1
+	fi
+	# 4) 设备自己就长得像模组(层级更深的集线器下,最上层看不出来)
+	if [ "$kind" = nic ]; then is_modem_dev "$usbdev" strict; else is_modem_dev "$usbdev"; fi && return 1
+
+	prod=$(rdf "$usbdev/product")
+	mfr=$(rdf "$usbdev/manufacturer")
+	ser=$(rdf "$usbdev/serial")
+	nm=${prod:-$mfr}
+	C_kind=$kind; C_vid=$vid; C_pid=$pid; C_drv=$drv
+	C_name=$(clean "${nm:-}")
+	C_id=$(clean "$C_bus/$vid:$pid/$ser")
+	return 0
+}
+
+# ---------------------------------------------------------------- 参数校验
+
+ok_text() {
+	[ "${#1}" -le 128 ] || return 1
+	[ "$(printf '%s' "$1" | tr -d '\000-\037\177')" = "$1" ]
+}
+
+valid_ip4() {
+	local IFS=. x
+	case "$1" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+	set -- $1
+	[ $# -eq 4 ] || return 1
+	for x in "$@"; do
+		[ "${#x}" -le 3 ] && [ "$x" -le 255 ] || return 1
+	done
+	return 0
+}
+
+valid_host_ip() {
+	valid_ip4 "$1" || return 1
+	case "${1%%.*}" in 0|127|22[4-9]|2[3-5][0-9]) return 1 ;; esac
+	return 0
+}
+
+valid_mask() {
+	case "$1" in
+		255.255.255.255|255.255.255.254|255.255.255.252|255.255.255.248|255.255.255.240|255.255.255.224|255.255.255.192|255.255.255.128|255.255.255.0) return 0 ;;
+		255.255.254.0|255.255.252.0|255.255.248.0|255.255.240.0|255.255.224.0|255.255.192.0|255.255.128.0|255.255.0.0) return 0 ;;
+		255.254.0.0|255.252.0.0|255.248.0.0|255.240.0.0|255.224.0.0|255.192.0.0|255.128.0.0|255.0.0.0) return 0 ;;
+		254.0.0.0|252.0.0.0|248.0.0.0|240.0.0.0|224.0.0.0|192.0.0.0|128.0.0.0) return 0 ;;
+	esac
+	return 1
+}
+
+A_proto=; A_username=; A_password=; A_ipaddr=; A_netmask=; A_gateway=; A_dns=
+
+# 读参数文件(只认白名单键)并删掉它。文件必须在 $RUN 下、是普通文件、不是符号链接
+read_args() {
+	local f="$1" l k v
+	[ -n "$f" ] || return 0
+	case "$f" in "$RUN"/*) ;; *) ERRMSG="参数文件位置不对"; return 1 ;; esac
+	if [ -L "$f" ] || [ ! -f "$f" ]; then ERRMSG="参数文件不存在"; return 1; fi
+	while IFS= read -r l; do
+		k=${l%%=*}; v=${l#*=}
+		case "$k" in
+			proto) A_proto=$v ;; username) A_username=$v ;; password) A_password=$v ;;
+			ipaddr) A_ipaddr=$v ;; netmask) A_netmask=$v ;; gateway) A_gateway=$v ;; dns) A_dns=$v ;;
+		esac
+	done < "$f"
+	rm -f "$f"
+	return 0
+}
+
+# $1=设备的 network 段名(改配置时复用已存的密码)
+valid_wan_args() {
+	local x
+	case "$A_proto" in
+		dhcp) ;;
+		pppoe)
+			[ -n "$A_username" ] || { ERRMSG="请填写宽带账号。"; return 1; }
+			ok_text "$A_username" || { ERRMSG="宽带账号太长或含有不可见字符。"; return 1; }
+			if [ -n "$A_password" ]; then
+				ok_text "$A_password" || { ERRMSG="宽带密码太长或含有不可见字符。"; return 1; }
+			elif [ -z "$(U -q get "network.$1.password" 2>/dev/null)" ]; then
+				ERRMSG="请填写宽带密码。"; return 1
+			fi
+			;;
+		static)
+			valid_host_ip "$A_ipaddr" || { ERRMSG="请填写正确的 IP 地址。"; return 1; }
+			valid_mask "$A_netmask" || { ERRMSG="请填写正确的子网掩码。"; return 1; }
+			if [ -n "$A_gateway" ]; then
+				valid_host_ip "$A_gateway" || { ERRMSG="请填写正确的网关地址。"; return 1; }
+				[ "$A_gateway" != "$A_ipaddr" ] || { ERRMSG="网关不能和本机 IP 相同。"; return 1; }
+			fi
+			for x in $A_dns; do
+				valid_host_ip "$x" || { ERRMSG="DNS 服务器地址不正确：$(clean "$x")"; return 1; }
+			done
+			;;
+		*) ERRMSG="上网方式参数不正确"; return 1 ;;
+	esac
+	return 0
+}
+
+# ---------------------------------------------------------------- 网桥(LAN)
+
+lan_bridge() {
+	local lan i=0 n ty
+	lan=$(U -q get network.lan.device 2>/dev/null); [ -n "$lan" ] || lan=br-lan
+	while U -q get "network.@device[$i]" >/dev/null 2>&1; do
+		n=$(U -q get "network.@device[$i].name" 2>/dev/null)
+		ty=$(U -q get "network.@device[$i].type" 2>/dev/null)
+		if [ "$n" = "$lan" ] && [ "$ty" = bridge ]; then
+			echo "@device[$i]"; return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
+}
+
+lan_add_port() {
+	local br p
+	br=$(lan_bridge) || { ERRMSG="没有找到局域网网桥的配置，无法加入局域网"; return 1; }
+	p=$(U -q get "network.$br.ports" 2>/dev/null)
+	case " $p " in
+		*" $1 "*) ;;
+		*) U add_list "network.$br.ports=$1" || return 1; D_NET=1 ;;
+	esac
+	save_set "lan.$1" 1
+	return 0
+}
+
+lan_del_port() {
+	local br p
+	if br=$(lan_bridge); then
+		p=$(U -q get "network.$br.ports" 2>/dev/null)
+		case " $p " in
+			*" $1 "*) U -q del_list "network.$br.ports=$1"; D_NET=1 ;;
+		esac
+	fi
+	save_del "lan.$1"
+}
+
+# ---------------------------------------------------------------- WAN 接口 + 防火墙
+
+fw_wan_zone() {
+	local i=0 n
+	while n=$(U -q get "firewall.@zone[$i].name" 2>/dev/null); do
+		[ "$n" = wan ] && { echo "@zone[$i]"; return 0; }
+		i=$((i + 1))
+	done
+	return 1
+}
+
+fw_zone_add() {
+	local z
+	z=$(fw_wan_zone) || return 1
+	U -q del_list "firewall.$z.network=$1"
+	U add_list "firewall.$z.network=$1" || return 1
+	D_FW=1
+}
+fw_zone_del() {
+	local z
+	z=$(fw_wan_zone) || return 0
+	if U -q get "firewall.$z.network" 2>/dev/null | tr ' ' '\n' | grep -qx "$1"; then
+		U -q del_list "firewall.$z.network=$1"
+		D_FW=1
+	fi
+}
+
+# 删掉某设备的接口段(含 v6 段)和防火墙项。不碰网关存活。
+wan_del_ifaces() {
+	local sec="$1" s
+	for s in "$sec" "${sec}v6"; do
+		if U -q get "network.$s" >/dev/null 2>&1; then
+			U -q delete "network.$s"; D_NET=1
+		fi
+		fw_zone_del "$s"
+	done
+}
+
+# 建 WAN 接口。$1=口名 $2=段名 $3=proto,参数在 A_*。成功时设置 R_pif。
+wan_make_iface() {
+	local dev="$1" sec="$2" proto="$3" x pw
+	pw=$A_password
+	[ -n "$pw" ] || pw=$(U -q get "network.$sec.password" 2>/dev/null)
+	wan_del_ifaces "$sec"
+	U set "network.$sec=interface" &&
+	U set "network.$sec.device=$dev" &&
+	U set "network.$sec.proto=$proto" &&
+	U set "network.$sec.mwrt_usbnic=1" &&
+	U set "network.$sec.metric=$WAN_METRIC" || return 1
+	R_pif=$dev
+	case "$proto" in
+		dhcp)
+			# IPv6 也要,和旧 usbwan.sh 一致
+			U set "network.${sec}v6=interface" &&
+			U set "network.${sec}v6.device=$dev" &&
+			U set "network.${sec}v6.proto=dhcpv6" &&
+			U set "network.${sec}v6.reqaddress=try" &&
+			U set "network.${sec}v6.reqprefix=auto" &&
+			U set "network.${sec}v6.mwrt_usbnic=1" &&
+			U set "network.${sec}v6.metric=$WAN_METRIC" || return 1
+			;;
+		pppoe)
+			U set "network.$sec.username=$A_username" &&
+			U set "network.$sec.password=$pw" &&
+			U set "network.$sec.pppname=$(pppname "$dev")" &&
+			U set "network.$sec.ipv6=auto" || return 1
+			# 守护进程拿默认路由的出口网卡比 primary_if,拨号时出口是 pppoe 接口,不是物理口
+			R_pif=$(pppname "$dev")
+			;;
+		static)
+			U set "network.$sec.ipaddr=$A_ipaddr" &&
+			U set "network.$sec.netmask=$A_netmask" || return 1
+			[ -n "$A_gateway" ] && { U set "network.$sec.gateway=$A_gateway" || return 1; }
+			for x in $A_dns; do U add_list "network.$sec.dns=$x" || return 1; done
+			;;
+	esac
+	D_NET=1
+	fw_zone_add "$sec" || return 1
+	[ "$proto" = dhcp ] && { fw_zone_add "${sec}v6" || return 1; }
+	R_sec=$sec
+	return 0
+}
+
+# ---------------------------------------------------------------- 网关存活(契约 E)
+
+FA=Mwrt-Assurance.wan_failover
+FO_RES=none
+
+fo_has() { [ -n "$(U -q get "$FA" 2>/dev/null)" ]; }
+
+# 按占用者栈最后一个的 primary_if 写网关存活
+fo_apply_last() {
+	local last pif
+	last=$(save_keys own. | tail -n 1)
+	[ -n "$last" ] || return 0
+	pif=$(save_get "own.$last")
+	fo_has || return 0
+	U set "$FA.enabled=1" && U set "$FA.primary_if=$pif" && U set "$FA.force_primary=1" || return 1
+	D_FO=1
+}
+
+# $1=口名 $2=primary_if。第一个占用者进来时把原值存到 flash,之后只管栈。
+fo_claim() {
+	local o v
+	fo_has || return 0
+	if [ -z "$(base_get enabled)" ]; then
+		for o in enabled primary_if secondary_if force_primary; do
+			v=$(U -q get "$FA.$o" 2>/dev/null)
+			base_set "$o" "${v:-@unset@}"
+		done
+	fi
+	save_set "own.$1" "$2"
+	fo_apply_last
+}
+
+# 网关存活现在的值还是不是我们写的(enabled=1、primary_if=$1、force_primary=1)?
+# 不是 = 占用期间用户或 MAX 单网口流程(port_set)改过,那份改动归它们,我们不去覆盖。
+fo_unchanged() {
+	[ "$(U -q get "$FA.enabled" 2>/dev/null)" = 1 ] &&
+	[ "$(U -q get "$FA.primary_if" 2>/dev/null)" = "$1" ] &&
+	[ "$(U -q get "$FA.force_primary" 2>/dev/null)" = 1 ]
+}
+
+# $1=口名。FO_RES: none=本来就没占 / kept=还有别的占用者、网关存活留给它 /
+# restored=原值已还原 / skipped=占用期间被别人改过,不还原只清存档
+fo_release() {
+	local o v mine top
+	FO_RES=none
+	mine=$(save_get "own.$1")
+	[ -n "$mine" ] || return 0
+	top=$(save_keys own. | tail -n 1)
+	save_del "own.$1"
+	if [ -n "$(save_keys own.)" ]; then
+		FO_RES=kept
+		# 拔的不是栈顶,网关存活本来就在别人那里,不动; 是栈顶才轮到下一个,且没被改过才改
+		if [ "$top" = "$1" ] && fo_unchanged "$mine"; then fo_apply_last; fi
+		return 0
+	fi
+	if fo_has; then
+		if fo_unchanged "$mine"; then
+			for o in enabled primary_if secondary_if force_primary; do
+				v=$(base_get "$o")
+				[ -n "$v" ] || continue
+				if [ "$v" = "@unset@" ]; then U -q delete "$FA.$o"; else U set "$FA.$o=$v"; fi
+			done
+			D_FO=1
+			# 原来就没开网关存活的,拔了以后没人会把被我们顶掉的默认路由补回来,得自己补
+			[ "$(base_get enabled)" = 1 ] || D_RT=1
+			FO_RES=restored
+		else
+			FO_RES=skipped
+			log "$1: 占用期间网关存活被改过,不还原原值"
+		fi
+	else
+		FO_RES=restored
+	fi
+	for o in enabled primary_if secondary_if force_primary; do base_del "$o"; done
+}
+
+# 按 netifd 记的补回缺失的默认路由(同 mwrt_wan_failover.sh 的 restore_defroutes,
+# 但这里是网关存活原来就关着的情形,守护进程不管,缺一条补一条)
+routes_reinstall() {
+	local i L D M G S src
+	command -v "$UBUS" >/dev/null 2>&1 || return 0
+	command -v jsonfilter >/dev/null 2>&1 || return 0
+	for i in $("$UBUS" call network.interface dump 2>/dev/null | jsonfilter -e '@.interface[@.up=true].interface' 2>/dev/null); do
+		case "$i" in usbwan_*) continue ;; esac
+		[ "$(U -q get "network.$i.defaultroute" 2>/dev/null)" = 0 ] && continue
+		[ -n "$(U -q get "network.$i.ip4table" 2>/dev/null)" ] && continue
+		L=; D=; M=; G=; S=
+		eval "$("$UBUS" call "network.interface.$i" status 2>/dev/null | jsonfilter \
+			-e 'L=@.l3_device' -e 'D=@.device' -e 'M=@.metric' \
+			-e 'G=@.route[@.target="0.0.0.0" && @.mask=0].nexthop' \
+			-e 'S=@.route[@.target="0.0.0.0" && @.mask=0].source' 2>/dev/null)"
+		G=${G%% *}; S=${S%% *}; S=${S%/*}
+		case "$L" in ''|*[!A-Za-z0-9_.@-]*) continue ;; esac
+		case "$G" in ''|*[!0-9.]*) continue ;; esac
+		case "$M" in ''|*[!0-9]*) M=0 ;; esac
+		"$IPC" -4 route show default dev "$L" 2>/dev/null | grep -q . && continue
+		src=
+		case "$S" in ''|0.0.0.0|*[!0-9.]*) ;; *) src="src $S" ;; esac
+		if [ "$G" = 0.0.0.0 ]; then
+			"$IPC" route replace default dev "$L" proto static metric "$M" $src 2>/dev/null
+		else
+			"$IPC" route replace default via "$G" dev "$L" proto static metric "$M" $src 2>/dev/null
+		fi
+	done
+}
+
+# ---------------------------------------------------------------- 提交与重载
+
+# 提交改过的 uci 包,生成 JSON,排一次网络重载。多个步骤合并成一次(去抖)。
+finish() {
+	[ "$D_NET" = 1 ] && U commit network
+	[ "$D_FW" = 1 ] && U commit firewall
+	[ "$D_FO" = 1 ] && U commit Mwrt-Assurance
+	write_json
+	queue_apply
+	D_NET=0; D_FW=0; D_FO=0; D_RT=0
+}
+
+# 出错时丢掉本次没提交的改动
+abort_changes() {
+	U -q revert network; U -q revert firewall; U -q revert Mwrt-Assurance
+	D_NET=0; D_FW=0; D_FO=0; D_RT=0
+}
+
+run_apply() {   # $1=net $2=fw $3=routes
+	[ "$1" = 1 ] && $NETRELOAD
+	[ "$2" = 1 ] && $FWRELOAD
+	if [ "$3" = 1 ]; then
+		[ "$SYNC" = 1 ] || sleep 4
+		routes_reinstall
+	fi
+}
+
+queue_apply() {
+	local fl="$D_NET $D_FW $D_RT" first=1
+	[ "$fl" = "0 0 0" ] && return 0
+	if [ "$SYNC" = 1 ]; then
+		run_apply "$D_NET" "$D_FW" "$D_RT"
+		return 0
+	fi
+	[ -f "$APPLYQ" ] && first=0
+	echo "$fl" >> "$APPLYQ"
+	# 已经有一个在等的就不再起了,它会把攒下的标记一起处理
+	[ "$first" = 1 ] || return 0
+	( exec 8>&- 9>&-; sleep 2; exec "$SELF" apply-now ) >/dev/null 2>&1 &
+}
+
+cmd_apply_now() {
+	local n=0 f=0 r=0 a b c
+	[ -f "$APPLYQ" ] || return 0
+	while read -r a b c; do
+		[ "$a" = 1 ] && n=1
+		[ "$b" = 1 ] && f=1
+		[ "$c" = 1 ] && r=1
+	done < "$APPLYQ"
+	rm -f "$APPLYQ"
+	run_apply "$n" "$f" "$r"
+}
+
+# ---------------------------------------------------------------- JSON
+
+jstr() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+write_json() {
+	local en=false first=1 d nw um
+	usben && en=true
+	nw=$(now); um=$(mono)
+	mkdir -p "$RUN"
+	{
+		printf '{"v":1,"enabled":%s,"devs":[' "$en"
+		if [ "$en" = true ]; then
+			for d in $(rec_list); do
+				rec_load "$d" || continue
+				[ "$first" = 1 ] || printf ','
+				first=0
+				# deadline 按"现在 + 单调剩余秒数"折成挂钟; dmono 一并给出, 读的一方(控制器)可在挂钟跳变后重新折算
+				[ -n "$R_dmono" ] && R_deadline=$((nw + R_dmono - um))
+				printf '{"dev":"%s","kind":"%s","name":"%s","vid":"%s","pid":"%s","drv":"%s","bus":"%s","role":"%s","proto":"%s","ts":%s,"deadline":%s,"dmono":%s}' \
+					"$(jstr "$d")" "$R_kind" "$(jstr "$R_name")" "$R_vid" "$R_pid" "$R_drv" "$(jstr "$R_bus")" \
+					"$R_role" "$R_proto" "${R_ts:-0}" "${R_deadline:-0}" "${R_dmono:-0}"
+			done
+		fi
+		printf ']}\n'
+	} > "$JSON.tmp" && mv -f "$JSON.tmp" "$JSON"
+}
+
+# ---------------------------------------------------------------- 超时定时器
+
+timer_cancel() {
+	local p c
+	[ -f "$DIR/$1.pid" ] || return 0
+	p=$(cat "$DIR/$1.pid" 2>/dev/null)
+	case "$p" in ''|*[!0-9]*) ;; *)
+		if grep -q mwrt-usbnic "/proc/$p/cmdline" 2>/dev/null; then
+			# 先杀它正在睡的 sleep 子进程, 再杀它自己, 不留孤儿 sleep
+			for c in $(grep -lx "PPid:[[:space:]]*$p" /proc/[0-9]*/status 2>/dev/null); do
+				c=${c#/proc/}; kill "${c%/status}" 2>/dev/null
+			done
+			kill "$p" 2>/dev/null
+		fi
+	;; esac
+	rm -f "$DIR/$1.pid"
+}
+
+# 短命后台子进程: 睡 TIMEOUT 秒,到点调 expire。要关掉继承来的锁文件描述符,
+# 否则它睡着的这一分钟里会一直占着主锁。
+timer_start() {
+	timer_cancel "$1"
+	( exec 8>&- 9>&-; sleep "$TIMEOUT"; sleep 1; exec "$SELF" expire "$1" "$2" ) >/dev/null 2>&1 &
+	echo $! > "$DIR/$1.pid"
+}
+
+# ---------------------------------------------------------------- 核心动作(调用时已持锁)
+
+default_name() { case "$1" in tether) echo "手机" ;; *) echo "USB网卡" ;; esac; }
+
+add_one() {
+	local dev="$1" t
+	usben || return 0
+	classify "$dev" || return 0
+	t=$(now)
+	R_kind=$C_kind; R_name=$C_name; R_vid=$C_vid; R_pid=$C_pid; R_drv=$C_drv; R_bus=$C_bus; R_id=$C_id
+	R_ts=$t; R_deadline=; R_dmono=; R_proto=; R_sec=; R_pif=
+	[ -n "$R_name" ] || R_name=$(default_name "$R_kind")
+	if [ "$R_kind" = nic ]; then
+		# 弹窗等用户选, 此时不入桥、不建接口
+		R_role=pending; R_deadline=$((t + TIMEOUT)); R_dmono=$(( $(mono) + TIMEOUT ))
+		rec_save "$dev"
+		timer_start "$dev" "$t"
+		ev nicin "$dev" "$R_name"
+		log "$dev: USB 网卡接入($R_drv),等待选择"
+	else
+		# 手机共享: 立刻 DHCP 建接口并设为出口
+		R_role=tether; R_proto=dhcp
+		A_proto=dhcp
+		R_sec=$(secname "$dev")
+		if wan_make_iface "$dev" "$R_sec" dhcp; then
+			fo_claim "$dev" "$R_pif"
+			rec_save "$dev"
+			ev thrin "$dev" "$R_name"
+			log "$dev: 手机共享接入($R_drv),已设为出口"
+		else
+			abort_changes
+			log "$dev: 手机共享建接口失败"
+		fi
+	fi
+}
+
+# 撤掉某设备的全部配置并删记录。设置 FO_RES。
+remove_one() {
+	local dev="$1" ty lb
+	rec_load "$dev" || return 0
+	timer_cancel "$dev"
+	FO_RES=none
+	case "$R_role" in
+		lan) lan_del_port "$dev" ;;
+		wan|tether)
+			wan_del_ifaces "${R_sec:-$(secname "$dev")}"
+			fo_release "$dev"
+			;;
+	esac
+	lb=$R_name
+	[ "$FO_RES" = restored ] && lb="${lb}（已恢复网关存活）"
+	ty=nicoff; [ "$R_kind" = tether ] && ty=throff
+	rm -f "$DIR/$dev" "$DIR/$dev.pid" "$DIR/$dev.tmp"
+	ev "$ty" "$dev" "$lb"
+	log "$dev: 已拔出($R_kind/$R_role),网关存活:$FO_RES"
+}
+
+# 把"此刻的 sysfs"和记录对齐
+reconcile() {
+	local dev="$1"
+	if classify "$dev"; then
+		if rec_load "$dev"; then
+			[ "$R_id" = "$C_id" ] && return 0
+			remove_one "$dev"      # 同名口被另一台设备顶替
+		fi
+		add_one "$dev"
+	else
+		rec_load "$dev" && remove_one "$dev"
+	fi
+	return 0
+}
+
+# 把 pending / lan / wan 的 nic 改成 LAN。$1=口名 $2=事件(niclan)
+to_lan() {
+	local dev="$1" was
+	rec_load "$dev" || return 1
+	was=$R_role
+	timer_cancel "$dev"
+	FO_RES=none
+	case "$was" in
+		wan)
+			wan_del_ifaces "${R_sec:-$(secname "$dev")}"
+			fo_release "$dev"
+			# 失败安装的默认路由(网关存活切换时装的)不归 netifd 管, 随口一起清掉
+			for _ in 1 2 3 4; do "$IPC" route del default dev "$dev" 2>/dev/null || break; done
+			;;
+	esac
+	if ! lan_add_port "$dev"; then
+		log "$dev: 加入网桥失败: $ERRMSG"
+	fi
+	R_role=lan; R_proto=; R_sec=; R_pif=; R_deadline=; R_dmono=
+	rec_save "$dev"
+	if [ "$FO_RES" = restored ]; then ev niclan "$dev" "${R_name}（已恢复网关存活）"; else ev niclan "$dev" "$R_name"; fi
+	return 0
+}
+
+# 把 nic 设成 WAN。参数在 A_*。
+to_wan() {
+	local dev="$1" sec
+	rec_load "$dev" || return 1
+	sec=$(secname "$dev")
+	valid_wan_args "$sec" || return 1
+	timer_cancel "$dev"
+	case "$R_role" in lan|pending) lan_del_port "$dev" ;; esac
+	if ! wan_make_iface "$dev" "$sec" "$A_proto"; then
+		abort_changes
+		ERRMSG="保存网络配置失败"
+		return 1
+	fi
+	fo_claim "$dev" "$R_pif"
+	R_role=wan; R_proto=$A_proto; R_deadline=; R_dmono=
+	rec_save "$dev"
+	ev nicwan "$dev" "$R_name"
+	return 0
+}
+
+# ---------------------------------------------------------------- 清扫(开机 / 开关关闭)
+
+# 清掉本脚本留在配置里的一切: 带标记的接口、网桥成员、防火墙项,网关存活还原
+sweep_all() {
+	local s k
+	for k in $(save_keys lan.); do lan_del_port "$k"; done
+	for s in $(U -q show network 2>/dev/null | sed -n "s/^network\.\([A-Za-z0-9_]*\)\.mwrt_usbnic='1'$/\1/p" | sort -u); do
+		U -q delete "network.$s"; D_NET=1
+		fw_zone_del "$s"
+	done
+	while [ -n "$(save_keys own.)" ]; do
+		k=$(save_keys own. | tail -n 1)
+		fo_release "$k"
+		[ -n "$(save_get "own.$k")" ] && save_del "own.$k"
+	done
+	# 只有 base 没有占用者的残留(异常中断)也还原
+	# (存档丢了、只剩 uci 里的镜像时也走这里)
+	if [ -n "$(base_get enabled)" ]; then
+		for s in enabled primary_if secondary_if force_primary; do
+			k=$(base_get "$s")
+			if [ -n "$k" ] && fo_has; then
+				if [ "$k" = "@unset@" ]; then U -q delete "$FA.$s"; else U set "$FA.$s=$k"; fi
+				D_FO=1
+			fi
+			base_del "$s"
+		done
+	fi
+}
+
+# ---------------------------------------------------------------- 命令
+
+cmd_plug() {
+	valid_dev "$1" || return 1
+	reconcile "$1"
+}
+
+cmd_unplug() {
+	local n=0
+	valid_dev "$1" || return 1
+	# remove 事件到来时 sysfs 里的口可能还没消失,等一下;等到头还在,
+	# 说明这是个过期事件(口又回来了), reconcile 会发现记录没问题而什么都不做
+	while [ -e "$SYS/class/net/$1/device" ] && [ "$n" -lt "$RMWAIT" ]; do
+		sleep 1; n=$((n + 1))
+	done
+	reconcile "$1"
+}
+
+cmd_rescan() {
+	local d dev
+	for dev in $(rec_list); do
+		[ -e "$SYS/class/net/$dev/device" ] || reconcile "$dev"
+	done
+	usben || return 0
+	for d in "$SYS"/class/net/*; do
+		[ -e "$d/device" ] || continue
+		reconcile "${d##*/}"
+	done
+}
+
+# 当前加载的记录(pending)是否已过期。有单调截止时间就只看它, 不受挂钟跳变影响
+pending_due() {
+	if [ -n "$R_dmono" ]; then [ "$(mono)" -ge "$R_dmono" ]; else [ "${R_deadline:-0}" -le "$(now)" ]; fi
+}
+
+cmd_expire_all() {
+	local dev t
+	t=$(now)
+	for dev in $(rec_list); do
+		rec_load "$dev" || continue
+		if [ ! -e "$SYS/class/net/$dev/device" ]; then reconcile "$dev"; continue; fi
+		if [ "$R_role" = pending ] && pending_due; then
+			to_lan "$dev"
+		fi
+	done
+}
+
+cmd_sync() {
+	local dev
+	if usben; then
+		cmd_rescan
+	else
+		QUIET=1
+		for dev in $(rec_list); do remove_one "$dev"; done
+		sweep_all
+		QUIET=0
+	fi
+}
+
+cmd_boot() {
+	rm -rf "$DIR"; rm -f "$APPLYQ"
+	sweep_all
+	usben && cmd_rescan
+}
+
+cmd_set() {
+	local dev="$1" role="$2" f="$3"
+	valid_dev "$dev" || { ERRMSG="设备名不正确"; return 1; }
+	case "$role" in lan|wan) ;; *) ERRMSG="接入方式参数不正确"; return 1 ;; esac
+	usben || { ERRMSG="USB网口检测开关未开启"; return 1; }
+	rec_load "$dev" || { ERRMSG="这个 USB 网卡已经拔出或没有被识别"; return 1; }
+	[ "$R_kind" = nic ] || { ERRMSG="手机共享口自动作为出口，不能手动设置"; return 1; }
+	[ -e "$SYS/class/net/$dev/device" ] || { ERRMSG="这个 USB 网卡已经拔出"; return 1; }
+	if [ "$role" = wan ]; then
+		read_args "$f" || return 1
+		to_wan "$dev" || return 1
+	else
+		[ -n "$f" ] && rm -f "$f"
+		if [ "$R_role" = lan ]; then return 0; fi
+		to_lan "$dev" || return 1
+	fi
+	return 0
+}
+
+cmd_ignore() {
+	valid_dev "$1" || { ERRMSG="设备名不正确"; return 1; }
+	rec_load "$1" || return 0
+	[ "$R_role" = pending ] || return 0
+	# 口已经没了(拔出事件还在路上): 当拔出处理,不留指向死口的 lan 记录
+	if [ ! -e "$SYS/class/net/$1/device" ]; then reconcile "$1"; return 0; fi
+	to_lan "$1"
+	return 0
+}
+
+cmd_expire() {
+	valid_dev "$1" || return 1
+	# 本进程就是那个定时器(exec 过来的, pid 相同): 先删 pid 文件, 否则 to_lan 里的
+	# timer_cancel 会把自己杀掉。只删记着自己 pid 的那份: 过期的旧定时器(同名口已重新
+	# 插入、新定时器写了新 pid)不能把新定时器的 pid 文件删掉。
+	[ "$(cat "$DIR/$1.pid" 2>/dev/null)" = "$$" ] && rm -f "$DIR/$1.pid"
+	rec_load "$1" || return 0
+	[ "$R_role" = pending ] && [ "$R_ts" = "$2" ] || return 0
+	# 到点时口已经不在(拔出事件被丢了或还没处理): 当拔出处理,不转 LAN
+	if [ ! -e "$SYS/class/net/$1/device" ]; then reconcile "$1"; return 0; fi
+	to_lan "$1"
+	return 0
+}
+
+# ---------------------------------------------------------------- 入口
+
+cmd="$1"; shift
+
+case "$cmd" in
+	apply-now) cmd_apply_now; exit 0 ;;
+	plug|unplug|set|ignore|expire|rescan|sync|boot|state) ;;
+	*) echo "用法: mwrt-usbnic plug|unplug|set|ignore|expire|rescan|sync|boot|state ..." >&2; exit 2 ;;
+esac
+
+# 事件可能一连串地来(开机、一拖多), 串行处理
+mkdir -p "$RUN"
+exec 9>"$LOCKF" || exit 1
+n=0
+while ! flock -n 9; do
+	n=$((n + 1))
+	[ "$n" -ge 60 ] && { echo "ERR:系统正忙，请稍后再试"; exit 1; }
+	sleep 1
+done
+
+rc=0
+case "$cmd" in
+	plug)   cmd_plug "$1"; rc=$? ;;
+	unplug) cmd_unplug "$1"; rc=$? ;;
+	set)    cmd_set "$1" "$2" "$3"; rc=$?
+	        if [ "$rc" = 0 ]; then echo OK; else abort_changes; echo "ERR:${ERRMSG:-设置失败}"; fi ;;
+	ignore) cmd_ignore "$1"; rc=$?
+	        if [ "$rc" = 0 ]; then echo OK; else echo "ERR:${ERRMSG:-设置失败}"; fi ;;
+	expire) cmd_expire "$1" "$2"; rc=$? ;;
+	rescan) cmd_rescan; rc=$? ;;
+	sync)   cmd_sync; rc=$? ;;
+	boot)   cmd_boot; rc=$? ;;
+	state)  cmd_expire_all; rc=$? ;;
+esac
+finish
+[ "$cmd" = state ] && cat "$JSON"
+exit "$rc"

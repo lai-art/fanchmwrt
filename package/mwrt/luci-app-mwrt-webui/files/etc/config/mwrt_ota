@@ -1,0 +1,4 @@
+
+config ota 'main'
+	option server 'https://mwrt.manper.me:15155'
+	option auto_check '1'

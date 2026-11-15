@@ -1,0 +1,19 @@
+#!/bin/sh
+# tom_modem 替身(NRadio C5800 专用): C5800 没有 qmodem, 固件里没有 /usr/bin/tom_modem, 而 smsforward 是写死去调
+# `tom_modem -c '<AT>' -d <口> -b <波特率> -t <超时> [-u]` 的二进制, 所以读短信、转发永远读不到。
+# 本脚本只由 /etc/init.d/smsforward 在 C5800 上通过 PATH 前置给 smsforward 用, 不装进 /usr/bin, 不影响别的机型。
+#
+# 只实现 smsforward 用到的那一种: 发一条 AT 并把回包打到标准输出。口/波特率/-u 一律忽略, 全部交给 /usr/bin/sendat:
+#   接了 AK68(/tmp/mwrt-ak68.atsd 在) → sendat 自己转 mwrt-akat(CMGL 走 nc 直连 + CMGR 兜底), 读的是 AK68 里的卡;
+#   没接 AK68 → sendat 走内置模组串口(at-daemon / sendat2)。
+cmd=""; to=3
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-c|--at_cmd) cmd="$2"; shift 2 ;;
+		-t|--timeout) to="$2"; shift 2 ;;
+		-d|--tty_dev|-b|--baud_rate|-B|--data_bits|-o|--operation|-p|--sms_pdu|-i|--sms_index) shift 2 ;;
+		*) shift ;;
+	esac
+done
+[ -n "$cmd" ] || exit 1
+exec /usr/bin/sendat 0 "$cmd" "$to"

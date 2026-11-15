@@ -1,0 +1,50 @@
+#!/bin/sh
+# mwrt-akat '<AT指令>' [超时秒] —— 经 ATSD 给 AK68 里的模组发一条 AT, 回包原样打到标准输出。
+# NRadio C5800 only: 接了 AK68 之后 WEBUI(webuiserver-shim/sendat)和 LED(netmodeled.sh)的 AT 都走这里,
+# 不再碰内置模组的 ttyUSB。ATSD 没通(/tmp/mwrt-ak68.atsd 不在)时本脚本不该被调用; 万一被调, 照实空回。
+cmd="$1"
+to="${2:-3}"; to="${to%.*}"
+case "$to" in ''|*[!0-9]*) to=3 ;; esac
+[ "$to" -ge 1 ] || to=1
+[ -n "$cmd" ] || exit 0
+[ -x /usr/bin/atsd_tools_cli ] || exit 1
+# 列短信(AT+CMGL)不能走 atsd_tools: 它的守护进程对这条命令只回一个 OK, 短信列表被吞了(AT+CMGR 单条没问题,
+# 直连 AK68 的 AT 口同一条命令返回完整列表)。所以 CMGL 直接 nc 到 AK68 的 AT 口(IP/端口就是 atsd_tools 的规则)。
+# 回包格式和 sendat 一致: 第一行空行, 其后是模组原文, 以 OK/ERROR 行结束; 最迟 $to 秒。
+case "$(printf '%s' "$cmd" | tr 'a-z' 'A-Z')" in
+AT+CMGL*)
+	srv=192.168.8.1; prt=20249
+	case "$(jsonfilter -i /tmp/mwrt-ak68.json -e '@.kind' 2>/dev/null)" in rm520n) srv=192.168.225.1; prt=1555 ;; esac
+	if command -v nc >/dev/null 2>&1; then
+		ff=/tmp/mwrt-akat.$$.done; of=/tmp/mwrt-akat.$$.out; rm -f "$ff" "$of"
+		( printf '%s\r' "$cmd"; i=0; while [ $i -lt $((to + 1)) ] && [ ! -e "$ff" ]; do sleep 1; i=$((i+1)); done ) |
+			timeout $((to + 3)) nc "$srv" "$prt" 2>/dev/null |
+			awk -v c="$cmd" -v f="$ff" '{l=$0; gsub(/\r/,"",l); if(NR==1 && toupper(l)==toupper(c)) next; print l; if(l=="OK"||l=="ERROR"||l ~ /^\+CM[ES] ERROR/){system("touch " f); exit}}' > "$of"
+		# 有时模组对 CMGL 只回一个 OK(存储里明明有短信, CMGR 单条却能读), 此时按 0-49 逐条 CMGR 读出来,
+		# 拼成 CMGL 的格式(+CMGL: 序号,状态,,长度 换行 PDU), 调用方(pdu_decoder)不用改。
+		if ! grep -q '^+CMGL:' "$of"; then
+			rm -f "$ff"
+			( i=0; while [ $i -lt 50 ]; do printf 'AT+CMGR=%s\r' $i; i=$((i+1)); done
+			  i=0; while [ $i -lt 8 ] && [ ! -e "$ff" ]; do sleep 1; i=$((i+1)); done ) |
+				timeout 12 nc "$srv" "$prt" 2>/dev/null |
+				awk -v f="$ff" 'BEGIN{n=0} {l=$0; gsub(/\r/,"",l); if(l ~ /^AT\+/) next
+					if(l ~ /^\+CMGR: /){split(substr(l,9),a,","); getline p; gsub(/\r/,"",p); print "+CMGL: " n "," a[1] ",," a[3]; print p; next}
+					if(l=="OK"||l=="ERROR"||l ~ /^\+CM[ES] ERROR/){n++; if(n>=50){system("touch " f); print "OK"; exit}}}' > "$of.2"
+			grep -q '^+CMGL:' "$of.2" && mv -f "$of.2" "$of"
+			rm -f "$of.2"
+		fi
+		echo
+		cat "$of"
+		rm -f "$ff" "$of"
+		exit 0
+	fi
+	;;
+esac
+# -w 是等回包的上限(毫秒), 回完 OK 就立即返回, 不会白等满。外面再套一层 timeout 防 atsd_tools 卡死。
+# atsd_tools_cli 的回包第一行是指令回显("AT^CHIPTEMP?"), 内置串口的 sendat 没有这行(第一行是空行)。
+# 调用方有 grep CHIPTEMP | sed -n 1p 这类写法, 回显会被当成数据行, 所以把回显行换成空行, 两边格式一致。
+if command -v timeout >/dev/null 2>&1; then
+	timeout $((to + 2)) /usr/bin/atsd_tools_cli -i cpe -c "$cmd" -w $((to * 1000)) 2>/dev/null
+else
+	/usr/bin/atsd_tools_cli -i cpe -c "$cmd" -w $((to * 1000)) 2>/dev/null
+fi | awk -v c="$cmd" 'NR==1{l=$0; gsub(/\r/,"",l); if(toupper(l)==toupper(c)){print ""; next}} {print}'

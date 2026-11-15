@@ -1,0 +1,65 @@
+#!/bin/sh /etc/rc.common
+# MT5700M-CN 新版 WEBUI 后端(webuiserver)。
+#
+# 2026-10-11 从 H5000M 固件移植。替换原来的 python websocket_server.py:
+#   旧: python3 /usr/bin/websocket_server.py &   监听 8766, 由 modeminit 裸起
+#   新: /usr/bin/webuiserver                     监听 8765, procd 带 respawn
+#
+# 只伺候 5700。其他模组(FM350 / 0e8d:7127 / RM5xx)的 WEBUI 还是走
+# /usr/bin/fm350webserver.py 的 :8889 那一套,modeminit 里那几个分支一行没动,
+# 这个服务在那些机型上直接不启动。
+#
+# 几个为什么:
+#   · 配置放 /etc/modemwebui/config.json —— webuiserver 先找 ./config.json
+#     (cwd),找不到再读这个绝对路径。走绝对路径就不用关心 cwd,也不用在
+#     /www 下面放一份配置被 http 服务暴露出去。已实测:没有 ./config.json
+#     和 ./web 目录也能正常启动。
+#   · SERIAL.PORT = "qmodem" —— 让它自己去 /etc/config/qmodem 读 at_port
+#     (本机 /dev/ttyUSB1),比 "auto" 好:auto 会从 ttyUSB0 开始逐个发 AT 探测,
+#     白占 AT 口。
+#   · SERIAL.MODE = "sendat" —— 走 /usr/bin/sendat 这个 python 封装,它自带
+#     /tmp/sendat.at.lock 的 flock 串行,能和 qmodem / tom_modem 错开。换成
+#     "direct" 会直接 open(ttyUSB1),和 qmodem 抢口,是 tom_modem 爆 PID 的老路。
+#   · PATH 前置 shim —— webuiserver 有机型白名单(只认 hiveton,h5000m 和
+#     Airpi,emmc-16g),靠 `cat /tmp/sysinfo/board_name` 判断,其他机型静默
+#     exit 1。详见 /usr/share/modem/webuiserver-shim/cat。
+#
+# 已知限制(和旧版一样,本次不处理):
+#   · 用 HTTPS 登录 LuCI 时,前端的 ws:// 会被浏览器按混合内容拦掉。
+#   · 前端「发短信」在二进制里写死 direct 模式、且要等 ">" 提示符,MT5700 不吐
+#     这个提示符,所以从新 WebUI 发短信预计不通。读短信和其他 AT 走 sendat 正常。
+
+USE_PROCD=1
+# modeminit 是 START=99, 这个要排在它后面 —— 它启动前需要 modeminit 写好的
+# /tmp/modconf.conf 和 qmodem 的 at_port。
+START=99
+STOP=10
+
+NAME=modemwebui
+PROG=/usr/bin/webuiserver
+SHIM_DIR=/usr/share/modem/webuiserver-shim
+
+start_service() {
+    [ -x "$PROG" ] || return 0
+
+    # 只在 5700 在位时启动。判据和 modeminit / gen_webui_config.sh 一致。
+    lsusb 2>/dev/null | grep -q '5700' || {
+        echo "Instance \"$NAME\" skipped: no MT5700 module."
+        return 0
+    }
+
+    procd_open_instance
+    # cwd 固定到 /tmp:webuiserver 会在 cwd 下找 ./config.json 和 ./web,这两个
+    # 我们都不想让它找到(配置走 /etc 绝对路径, HTTP 8001 不用)。/tmp 下没有这
+    # 两个名字,等于显式地让它走绝对路径分支。
+    procd_set_param command /bin/sh -c "cd /tmp && exec '$PROG'"
+    procd_set_param env PATH="$SHIM_DIR:/usr/sbin:/usr/bin:/sbin:/bin"
+    procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-0}
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+service_triggers() {
+    procd_add_reload_trigger "qmodem"
+}

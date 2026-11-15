@@ -1,0 +1,811 @@
+#!/bin/sh
+#
+# /usr/libexec/rpcd/luci.mwrt-ota —— 固件在线更新的后端
+#
+# 流程: info(本机机型键/版本/构建时间) -> check(问服务器) -> download(后台 curl)
+#       -> progress(轮询) -> verify(sha256) -> test(校验镜像) -> upgrade(腾内存后刷写)
+#
+# 设计约束:
+#  * 这台机器没有 rpc-sys(ubus -v list rpc-sys 为空), flash.js 那条
+#    upgrade_test/upgrade_start 的路走不通, 所以刷写也在这里做, 直接调 /sbin/sysupgrade。
+#  * 只走 https + 内置 CA(/etc/mwrt/ota-ca.pem), 不用 -k。
+#  * 服务器给的 url 只接受 /fw/ 开头、不含 .. 的相对路径, sha256 必须 64 位 hex。
+#    迁移期可另给 dl(新服务器上同一路径), 先直连它下载, 失败回退 url, 见 dl_direct。
+#  * upgrade 只认"已下载 + 已校验 + 已 test 通过"的同一个文件, 且必须带 confirm=yes。
+#    默认 -n(不保留配置)。upgrade 的 keep 是用户勾选要保留的几项(wifi,simsel,fan,led),
+#    由 /usr/libexec/mwrt-keepcfg 抽成一份小清单 -f 带过去, 新固件首启校验后写回;
+#    整份配置永远不带(旧配置整份进新固件是不稳定的主要来源)。
+#  * 机型键不能用 board_name: 798 和 3600 两个机型的 SUPPORTED_DEVICES 都含
+#    NRadio-C2000MAX-Ultra。用 DT model 映射, uci mwrt_ota.main.board 可手工覆盖。
+#
+# 小内存机型(C2000MAX 512M, 平时可用 ~128M, 固件 ~130M):
+#  * 原来固件直接下到 /tmp, 空间只看 df /tmp —— tmpfs 上限是内存的一半, 不代表真有这么多
+#    空闲内存; 用户再开着 OpenClash 之类, 固件一进内存就可能卡死。
+#  * 现在下载前按 MemAvailable 选地方: 下完还能剩 256M 才放内存, 否则暂存到 SD 卡
+#    (/overlay 分区根目录, 不在 upper 里, 系统看不到, -n 刷写后自然清掉), 校验也在 SD 上做。
+#  * sysupgrade 只认 /tmp 里的镜像(overlay 刷写时会被覆盖), 所以开刷前固件必须进内存。
+#    upgrade 只是起一个后台任务(本脚本 flash 命令), 按需一步步腾内存:
+#      停占内存的插件 -> 关 SD 上的 swap(它就在要被覆盖的分区里) -> 还不够就关无线
+#      -> 够了把固件拷进 /tmp 再复核 sha256 -> (打保留包) -> sysupgrade -n 或 -f 保留包
+#    任何一步失败都把停掉的服务/swap/无线恢复原样, 页面经 progress 的 ustate 拿到结果。
+#
+# 协议: rpcd shell 插件。`list` 吐方法表, `call <method>` 从 stdin 读参数。
+# 命令行: `luci.mwrt-ota cron` 给 cron 用(只查不下);
+#         `luci.mwrt-ota flash` 是 upgrade 起的后台任务;
+#         `luci.mwrt-ota flash-dry` 演练腾内存全过程但不刷写, 最后原样恢复(调试用)。
+#
+# 自动检查频率(cron 每小时在本机随机的固定分钟跑一次, 是否真去问服务器由这里决定):
+#  * 距上次成功检查满 24 小时才查。检查只是一个很小的 JSON 请求, 一天一次
+#    和主流路由器/网关的默认一致, 1 万台设备也只有每天 1 万次请求。
+#  * 缓存在 /tmp, 重启即清, 所以开机后第一个整点就会查一次(断电期间错过的补上)。
+#  * 失败(没网/服务器不通)不记成功, 下个小时自然重试, 不会集中重试打爆服务器。
+#  * 开机 5 分钟内不查(等拨号和 NTP); 时钟早于固件构建时间说明还没对时,
+#    TLS 证书校验必然失败, 也不查。
+#  * 只检查, 从不自动下载、从不自动刷写。
+
+. /usr/share/libubox/jshn.sh
+
+CA=/etc/mwrt/ota-ca.pem
+D=/tmp/mwrt-ota
+RAMFW=/tmp/firmware.bin
+SDD=/overlay/mwrt-ota
+FWP=$D/fw.path
+LATEST=$D/latest.json
+PIDF=$D/dl.pid
+CURLPID=$D/curl.pid
+RCF=$D/dl.rc
+ERRF=$D/dl.err
+VIAF=$D/dl.via
+VERIFIED=$D/verified
+TESTED=$D/tested
+LASTTRY=$D/last.try
+LASTERR=$D/last.err
+# upgrade 后台任务的状态: preparing / flashing / failed
+USTATE=$D/flash.state
+USTEP=$D/flash.step
+UERR=$D/flash.err
+UDETAIL=$D/flash.detail
+FLOG=$D/flash.log
+STOPPED=$D/flash.stopped
+WIFIDOWN=$D/flash.wifi
+SWAPS=$D/flash.swaps
+LOCKD=$D/flash.lock
+UKEEP=$D/flash.keep
+KEEPCFG=/usr/libexec/mwrt-keepcfg
+KEEPTGZ=/tmp/mwrt-keep.tgz
+CRONTAB=/etc/crontabs/root
+# 自动检查间隔 24h; 减 10 分钟容差, 免得 cron 秒数抖动把检查推迟到第 25 小时
+AUTO_EVERY=$((86400 - 600))
+
+MB=1048576
+RAM_KEEP=$((256 * MB))   # 下到内存后至少还剩这么多可用内存, 否则放 SD
+RAM_MIN=$((64 * MB))     # 没有 SD 可放时, 下到内存后的最低余量
+# 开刷那一刻(固件已在内存里)还要剩的可用内存: 腾内存时以 RESERVE 为目标, 全部手段用完
+# 还不到 FLOOR 才放弃。stage2 几秒后会杀光用户态进程再写盘, 只要撑过这几秒;
+# C2000MAX 平时可用 ~128M、固件 ~130M, 下限定太高会变成永远升级不了。
+RESERVE=$((32 * MB))
+FLOOR=$((12 * MB))
+
+# 升级前可以先停掉的大户: 代理/容器/下载/统计类插件。反正 stage2 几秒后也会把它们杀掉,
+# 停之前记下来, 准备失败时原样起回来。只停 enabled 的。
+HEAVY="openclash passwall passwall2 passwall_server shadowsocksr bypass vssr homeproxy nikki mihomo
+daed dae sing-box xray v2ray naiveproxy haproxy AdGuardHome adguardhome alist dockerd frpc frps
+zerotier tailscale ddns-go uuplugin acc qbittorrent transmission aria2 samba4 ksmbd minidlna
+collectd netdata nlbwmon modemwebui"
+
+u() { uci -q get "$1" 2>/dev/null; }
+
+server() {
+	local s
+	s=$(u mwrt_ota.main.server)
+	[ -n "$s" ] || s=https://103.233.254.163
+	echo "${s%/}"
+}
+
+board_key() {
+	local k m
+	k=$(u mwrt_ota.main.board)
+	[ -n "$k" ] && { echo "$k"; return; }
+	m=$(cat /tmp/sysinfo/model 2>/dev/null)
+	case "$m" in
+		NRadio-C2000Ultra*)  echo NRadio-C2000MAX-798 ;;
+		NRadio-C2000MAX*)    echo NRadio-C2000MAX-3600 ;;
+		*E87N*|*e87n*)       echo edgepi-e87n ;;
+		*H5000M*|*h5000m*)   echo hiveton-h5000m ;;
+		*N5000*|*n5000*)     echo NRadio-N5000 ;;
+		*)                   echo "" ;;
+	esac
+}
+
+# '@Manper-5.1.1139-24 by ...' -> 5.1.1139
+cur_version() {
+	(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_RELEASE") |
+		grep -oE '[0-9]+(\.[0-9]+){1,3}' | head -n1
+}
+
+cur_build() {
+	local b
+	b=$(. /usr/lib/os-release 2>/dev/null; echo "$OPENWRT_BUILD_DATE")
+	case "$b" in ''|*[!0-9]*) b=0 ;; esac
+	echo "$b"
+}
+
+jf() { jsonfilter -i "$LATEST" -e "$1" 2>/dev/null; }
+
+err() { json_init; json_add_boolean ok 0; json_add_string error "$1"; json_dump; }
+
+dl_running() {
+	local p
+	[ -f "$PIDF" ] || return 1
+	p=$(cat "$PIDF" 2>/dev/null)
+	[ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+# 不读文件内容(固件在 SD 上时每次轮询整读一遍太慢)
+fsize() { set -- $(ls -ln "$1" 2>/dev/null); echo "${5:-0}"; }
+
+# 本次固件放在哪: /tmp/firmware.bin 或 /overlay/mwrt-ota/firmware.bin
+fw() { local p; p=$(cat "$FWP" 2>/dev/null); echo "${p:-$RAMFW}"; }
+part_of() { case "$1" in "$SDD"/*) echo "$SDD/firmware.part" ;; *) echo "$D/firmware.part" ;; esac; }
+where() { case "$(fw)" in /tmp/*) echo ram ;; *) echo sd ;; esac; }
+
+mem_avail() { awk '/^MemAvailable:/ { print $2 * 1024; exit }' /proc/meminfo; }
+
+df_avail() { df -k "$1" 2>/dev/null | awk 'END { print $(NF-2) * 1024 }'; }
+
+# /tmp 能放下固件再留 32M
+tmp_ok() { [ "$(df_avail /tmp)" -gt $(($1 + 32 * MB)) ] 2>/dev/null; }
+
+# /overlay 是 SD/eMMC 上的 f2fs/ext4(不是 NAND 的 ubifs/jffs2, 也不是 tmpfs), 且放得下固件再留 64M
+sd_ok() {
+	set -- "$1" $(awk '$2 == "/overlay" { print $1, $3; exit }' /proc/mounts)
+	case "$3" in f2fs|ext4) ;; *) return 1 ;; esac
+	case "$2" in /dev/loop*|/dev/mmcblk*|/dev/sd*|/dev/nvme*) ;; *) return 1 ;; esac
+	[ "$(df_avail /overlay)" -gt $(($1 + 64 * MB)) ] 2>/dev/null
+}
+
+flash_busy() { case "$(cat "$USTATE" 2>/dev/null)" in preparing|flashing) return 0 ;; esac; return 1; }
+
+clean_fw() {
+	rm -f "$RAMFW" "$D/firmware.part" "$SDD/firmware.bin" "$SDD/firmware.part" "$FWP" \
+		"$PIDF" "$CURLPID" "$RCF" "$ERRF" "$VIAF" "$VERIFIED" "$TESTED" \
+		"$USTATE" "$USTEP" "$UERR" "$UDETAIL" "$STOPPED" "$WIFIDOWN" "$SWAPS"
+	rmdir "$SDD" "$LOCKD" 2>/dev/null
+}
+
+# 把缓存的服务器应答按字段重新输出, 不直接透传服务器的 JSON
+emit_latest() {
+	local upd
+	json_init
+	json_add_boolean ok 1
+	json_add_string board "$(board_key)"
+	json_add_string cur_version "$(cur_version)"
+	json_add_string cur_build "$(cur_build)"
+	if [ ! -s "$LATEST" ]; then
+		json_add_boolean checked 0
+		json_dump
+		return
+	fi
+	json_add_boolean checked 1
+	json_add_int checked_at "$(date -r "$LATEST" +%s 2>/dev/null || echo 0)"
+	upd=$(jf '@.update')
+	if [ "$upd" = "true" ]; then
+		json_add_boolean update 1
+		json_add_string version "$(jf '@.version')"
+		json_add_string build "$(jf '@.build')"
+		json_add_string size "$(jf '@.size')"
+		json_add_string sha256 "$(jf '@.sha256')"
+		json_add_string filename "$(jf '@.filename')"
+		json_add_string title "$(jf '@.title')"
+		json_add_string notes "$(jf '@.notes')"
+		json_add_string description "$(jf '@.description')"
+		json_add_string published "$(jf '@.published')"
+	else
+		json_add_boolean update 0
+	fi
+	json_dump
+}
+
+auto_on() { [ "$(u mwrt_ota.main.auto_check)" != "0" ]; }
+
+last_ok() { if [ -s "$LATEST" ]; then date -r "$LATEST" +%s 2>/dev/null || echo 0; else echo 0; fi; }
+
+# 预计下次自动检查的时间点: 不早于"上次成功 + 间隔", 且落在 cron 的那一分钟上
+next_check() {
+	local m now base cur d t
+	auto_on || { echo 0; return; }
+	m=$(awk '/luci\.mwrt-ota cron/ { print $1; exit }' "$CRONTAB" 2>/dev/null)
+	case "$m" in ''|*[!0-9]*) echo 0; return ;; esac
+	now=$(date +%s)
+	base=$(( $(last_ok) + AUTO_EVERY ))
+	[ "$base" -gt "$now" ] || base=$now
+	# 分钟数直接从 epoch 算: 整点时区(含东八区)下本地分钟 = UTC 分钟
+	cur=$(( (base / 60) % 60 ))
+	d=$(( (m - cur + 60) % 60 ))
+	t=$(( base - base % 60 + d * 60 ))
+	[ "$t" -ge "$base" ] || t=$(( t + 3600 ))
+	echo "$t"
+}
+
+m_info() {
+	json_init
+	json_add_boolean ok 1
+	json_add_string board "$(board_key)"
+	json_add_string model "$(cat /tmp/sysinfo/model 2>/dev/null)"
+	json_add_string version "$(cur_version)"
+	json_add_string build "$(cur_build)"
+	json_add_string release "$(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_RELEASE")"
+	auto_on && json_add_boolean auto_check 1 || json_add_boolean auto_check 0
+	json_add_int last_ok "$(last_ok)"
+	json_add_int last_try "$(cat "$LASTTRY" 2>/dev/null || echo 0)"
+	json_add_string last_err "$(cat "$LASTERR" 2>/dev/null)"
+	json_add_int next_check "$(next_check)"
+	json_dump
+}
+
+m_set_auto() {
+	case "$1" in
+		1|true)  uci -q set mwrt_ota.main.auto_check=1 ;;
+		0|false) uci -q set mwrt_ota.main.auto_check=0 ;;
+		*) err bad_value; return ;;
+	esac
+	uci -q commit mwrt_ota
+	m_info
+}
+
+# 只问服务器、写缓存。成功返回 0。每次尝试都记时间和结果, 页面上显示。
+do_check() {
+	mkdir -p "$D"
+	date +%s > "$LASTTRY"
+	if do_check_once; then
+		rm -f "$LASTERR"
+		return 0
+	fi
+	echo "$CHECK_ERR" > "$LASTERR"
+	return 1
+}
+
+do_check_once() {
+	local key tmp code
+	key=$(board_key)
+	[ -n "$key" ] || { CHECK_ERR=unknown_board; return 1; }
+	[ -f "$CA" ] || { CHECK_ERR=no_ca; return 1; }
+	tmp=$D/check.tmp
+	code=$(curl -sS --cacert "$CA" -m 20 -o "$tmp" -w '%{http_code}' -G \
+		--data-urlencode "board=$key" \
+		--data-urlencode "version=$(cur_version)" \
+		--data-urlencode "build=$(cur_build)" \
+		"$(server)/api/v1/check" 2>/dev/null)
+	if [ "$code" != "200" ] || ! jsonfilter -i "$tmp" -e '@.update' >/dev/null 2>&1; then
+		rm -f "$tmp"
+		[ "$code" = "000" ] && CHECK_ERR=nonet || CHECK_ERR="http_$code"
+		return 1
+	fi
+	mv -f "$tmp" "$LATEST"
+	return 0
+}
+
+m_check() {
+	do_check || { err "$CHECK_ERR"; return; }
+	emit_latest
+}
+
+m_latest() { emit_latest; }
+
+# 服务器迁移期: check 应答可能多给一个 dl(新服务器上同一个文件的完整地址)。
+# 设备照旧填老地址, check/认证这些小请求经老服务器转发, 大文件直连新服务器下载。
+# 只认 https://<主机>[:端口] + 和 url 完全相同的 /fw/ 路径; 和配置的服务器同址、格式不对都当没给。
+# 同一个 CA 校验, 下完照样比 sha256, 所以 dl 指错了也只会下载失败, 不会刷进别的东西。
+dl_direct() {
+	local d h
+	d=$(jf '@.dl')
+	case "$d" in https://*) ;; *) return 0 ;; esac
+	h=${d#https://}; h=${h%%/*}
+	[ "https://$h$1" = "$d" ] || return 0
+	echo "$h" | grep -qE '^[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$' || return 0
+	[ "https://$h" = "$(server)" ] && return 0
+	echo "$d"
+}
+
+m_download() {
+	local url sha size mem fwp dl
+	[ -s "$LATEST" ] && [ "$(jf '@.update')" = "true" ] || { err no_update; return; }
+	url=$(jf '@.url'); sha=$(jf '@.sha256'); size=$(jf '@.size')
+	case "$url" in /fw/*) ;; *) err bad_url; return ;; esac
+	case "$url" in *..*|*' '*) err bad_url; return ;; esac
+	echo "$sha" | grep -qE '^[0-9a-f]{64}$' || { err bad_sha; return; }
+	case "$size" in ''|*[!0-9]*) err bad_size; return ;; esac
+	dl=$(dl_direct "$url")
+	flash_busy && { err busy; return; }
+	if dl_running; then
+		json_init; json_add_boolean ok 1; json_add_string state running; json_dump
+		return
+	fi
+	# 放哪: 内存宽裕放 /tmp; 否则 SD; 都不行再看内存勉强够不够
+	mem=$(mem_avail)
+	if [ $((mem - size)) -ge $RAM_KEEP ] && tmp_ok "$size"; then
+		fwp=$RAMFW
+	elif sd_ok "$size"; then
+		fwp=$SDD/firmware.bin
+	elif [ $((mem - size)) -ge $RAM_MIN ] && tmp_ok "$size"; then
+		fwp=$RAMFW
+	else
+		err no_space; return
+	fi
+	clean_fw
+	mkdir -p "$D" "${fwp%/*}" || { err no_space; return; }
+	echo "$fwp" > "$FWP"
+	echo "$sha" > "$D/expect.sha"
+	echo "$size" > "$D/expect.size"
+	# 后台下载, 和 rpcd 脱钩。完成后 .part 改名为 firmware.bin; curl 的 pid 单独记, cancel 要杀它。
+	# 有 dl 先直连它, 失败再从配置的服务器续传(同一个文件, -C - 接着下)。dl.via 记最后用的地址
+	setsid sh -c '
+		rc=1
+		for u in "$8" "$3"; do
+			[ -n "$u" ] || continue
+			echo "$u" > "$9"
+			curl -sS --fail --cacert "$1" --connect-timeout 20 -m 1800 --retry 2 -C - -o "$2" "$u" 2>"$4" &
+			echo $! > "$7"
+			wait $!
+			rc=$?
+			[ $rc -eq 0 ] && break
+		done
+		[ $rc -eq 0 ] && mv -f "$2" "$5"
+		echo $rc > "$6"
+	' _ "$CA" "$(part_of "$fwp")" "$(server)$url" "$ERRF" "$fwp" "$RCF" "$CURLPID" "$dl" "$VIAF" </dev/null >/dev/null 2>&1 &
+	echo $! > "$PIDF"
+	json_init; json_add_boolean ok 1; json_add_string state started; json_add_string where "$(where)"; json_dump
+}
+
+m_progress() {
+	local total got state rc f
+	f=$(fw)
+	total=$(cat "$D/expect.size" 2>/dev/null); [ -n "$total" ] || total=0
+	if dl_running; then
+		state=running; got=$(fsize "$(part_of "$f")")
+	elif [ -f "$RCF" ]; then
+		rc=$(cat "$RCF")
+		if [ "$rc" = "0" ] && [ -f "$f" ]; then state=done; got=$(fsize "$f")
+		else state=failed; got=$(fsize "$(part_of "$f")"); fi
+	else
+		state=idle; got=0
+	fi
+	json_init
+	json_add_boolean ok 1
+	json_add_string state "$state"
+	json_add_string got "$got"
+	json_add_string total "$total"
+	json_add_string where "$(where)"
+	[ -n "$rc" ] && json_add_string rc "$rc"
+	json_add_string ustate "$(cat "$USTATE" 2>/dev/null)"
+	json_add_string ustep "$(cat "$USTEP" 2>/dev/null)"
+	json_add_string uerr "$(cat "$UERR" 2>/dev/null)"
+	json_add_string udetail "$(cat "$UDETAIL" 2>/dev/null)"
+	json_dump
+}
+
+m_cancel() {
+	local p
+	flash_busy && { err busy; return; }
+	# 先杀外层 sh 再杀 curl: 反过来的话, 直连失败会马上起回退那次下载, 漏杀
+	for p in "$(cat "$PIDF" 2>/dev/null)" "$(cat "$CURLPID" 2>/dev/null)"; do
+		[ -n "$p" ] && kill "$p" 2>/dev/null
+	done
+	clean_fw
+	json_init; json_add_boolean ok 1; json_dump
+}
+
+m_verify() {
+	local want got size f
+	f=$(fw)
+	[ -f "$f" ] || { err no_file; return; }
+	want=$(cat "$D/expect.sha" 2>/dev/null)
+	size=$(cat "$D/expect.size" 2>/dev/null)
+	[ "$(fsize "$f")" = "$size" ] || { err size_mismatch; return; }
+	got=$(sha256sum "$f" | cut -d' ' -f1)
+	json_init
+	json_add_string sha256 "$got"
+	json_add_string where "$(where)"
+	if [ -n "$want" ] && [ "$got" = "$want" ]; then
+		echo "$got" > "$VERIFIED"
+		json_add_boolean ok 1
+	else
+		rm -f "$VERIFIED"
+		json_add_boolean ok 0
+		json_add_string error sha_mismatch
+	fi
+	json_dump
+}
+
+# 直接跑 sysupgrade 用的那个校验脚本: sysupgrade -T 遇到不在 /tmp 的文件会先整个
+# 拷进 /tmp/sysupgrade.img, 固件暂存在 SD 上就白做了。-T 本身也只是跑这个脚本。
+m_test() {
+	local out f
+	f=$(fw)
+	[ -f "$f" ] && [ -f "$VERIFIED" ] || { err not_verified; return; }
+	out=$(/usr/libexec/validate_firmware_image "$f" 2>&1 >"$D/validate.json")
+	json_init
+	if [ "$(jsonfilter -i "$D/validate.json" -e '@.valid' 2>/dev/null)" = "true" ]; then
+		cp -f "$VERIFIED" "$TESTED"
+		json_add_boolean ok 1
+	else
+		rm -f "$TESTED"
+		json_add_boolean ok 0
+		json_add_string error test_failed
+		json_add_string output "$(echo "$out" | tail -n 8)"
+	fi
+	json_dump
+}
+
+# 只起后台任务就返回; 页面轮询 progress 的 ustate/ustep 看进展
+m_upgrade() {
+	local confirm="$1" keep="$2" f
+	[ "$confirm" = "yes" ] || { err need_confirm; return; }
+	case "$keep" in *[!a-z,]*) err bad_keep; return ;; esac
+	if flash_busy; then
+		json_init; json_add_boolean ok 1; json_add_string state "$(cat "$USTATE")"; json_dump
+		return
+	fi
+	f=$(fw)
+	[ -f "$f" ] && [ -f "$TESTED" ] || { err not_tested; return; }
+	mkdir "$LOCKD" 2>/dev/null || { err busy; return; }
+	rm -f "$UERR" "$UDETAIL" "$STOPPED" "$WIFIDOWN" "$SWAPS" "$FLOG"
+	printf '%s\n' "$keep" > "$UKEEP"
+	echo start > "$USTEP"
+	echo preparing > "$USTATE"
+	json_init; json_add_boolean ok 1; json_add_string state preparing; json_dump
+	setsid "$0" flash </dev/null >/dev/null 2>&1 &
+}
+
+# ---------------------------------------------------------------- upgrade 后台任务
+
+flog() { echo "$(date '+%H:%M:%S') $*" >> "$FLOG"; logger -t mwrt-ota "$*"; }
+step() { echo "$1" > "$USTEP"; flog "step $1"; }
+mbs() { echo $(( $1 / MB )); }
+
+drop_caches() { sync; echo 3 > /proc/sys/vm/drop_caches; }
+
+# 非 zram 的 swap(SD 上的 swapfile): 名字 已用KB 优先级
+disk_swaps() { awk 'NR > 1 && $1 !~ /^\/dev\/zram/ { print $1, $4, $5 }' /proc/swaps; }
+disk_swap_used() { awk 'NR > 1 && $1 !~ /^\/dev\/zram/ { s += $4 } END { print s * 1024 }' /proc/swaps; }
+
+run_to() { # <秒> <命令...>  busybox 没有 timeout
+	local t=$1 p w=0
+	shift
+	"$@" >/dev/null 2>&1 &
+	p=$!
+	while kill -0 $p 2>/dev/null; do
+		[ $w -ge $t ] && { kill $p 2>/dev/null; return 1; }
+		sleep 1
+		w=$((w + 1))
+	done
+	wait $p
+}
+
+# 管网页/拨号/风扇/无线/系统本身的服务, 怎么都不停
+keep_svc() {
+	case "$1" in
+		rpcd|uhttpd|network|firewall|dnsmasq|odhcpd|log|dropbear|ttyd|cron|sysntpd|urngd|\
+		ubus-at-daemon|qmodem*|modeminit|wifi*|mtk_smp|Airpifanctrl|mwrt-*|led|zram|boot|system|\
+		sysctl|umount|fstab|done|gpio_switch|switch_ctl|usbmode|pcie_mhi|ubihealthd|bootcount|\
+		urandom_seed|mwrtreboot|sysfixtime|cgroupfs-mount|mdadm)
+			return 0 ;;
+	esac
+	return 1
+}
+
+# procd 管的服务里进程树常驻内存(RSS)不小于 <KB> 的: 用户自己装的插件也能覆盖到
+big_services() {
+	local min=$1 svcs s insts i pid
+	json_load "$(ubus call service list 2>/dev/null)" 2>/dev/null || return 0
+	json_get_keys svcs
+	{
+		for s in $svcs; do
+			json_select "$s" 2>/dev/null || continue
+			if json_select instances 2>/dev/null; then
+				json_get_keys insts
+				for i in $insts; do
+					json_select "$i" 2>/dev/null || continue
+					pid=
+					json_get_var pid pid
+					[ -n "$pid" ] && echo "S $s $pid"
+					json_select ..
+				done
+				json_select ..
+			fi
+			json_select ..
+		done
+		cat /proc/[0-9]*/status 2>/dev/null
+	} | awk -v min="$min" '
+		$1 == "S"      { svc[$3] = $2; next }
+		$1 == "Pid:"   { pid = $2; next }
+		$1 == "PPid:"  { pp[pid] = $2; next }
+		$1 == "VmRSS:" { rss[pid] = $2; next }
+		END {
+			for (p in pp) {
+				q = p; n = 0
+				while (q != "" && q > 1 && !(q in svc) && n < 64) { q = pp[q]; n++ }
+				if (q in svc) tot[svc[q]] += rss[p]
+			}
+			for (s in tot) if (tot[s] >= min) print s, tot[s]
+		}'
+}
+
+stop_services() { # <RSS 门槛 KB> <是否连 HEAVY 名单一起停 1|0>
+	local s list=""
+	if [ "$2" = 1 ]; then
+		for s in $HEAVY; do
+			[ -x "/etc/init.d/$s" ] && "/etc/init.d/$s" enabled 2>/dev/null && list="$list $s"
+		done
+	fi
+	for s in $(big_services "$1" | awk '{ print $1 }'); do
+		keep_svc "$s" && continue
+		[ -x "/etc/init.d/$s" ] || continue
+		case " $list " in *" $s "*) ;; *) list="$list $s" ;; esac
+	done
+	for s in $list; do
+		grep -qx "$s" "$STOPPED" 2>/dev/null && continue
+		flog "stop $s"
+		echo "$s" >> "$STOPPED"
+		run_to 60 "/etc/init.d/$s" stop
+	done
+}
+
+# 无线收包缓冲占内存不少; sysupgrade 自己进 stage2 前也要 ifconfig ra0/rai0 down。
+# 先关虚接口再关主接口, 恢复时倒过来(主接口先起)。
+wifi_down() {
+	local n f pass
+	for pass in vif main; do
+		for n in $(ls /sys/class/net 2>/dev/null); do
+			case "$n" in
+				ra0|rai0|rax0) [ $pass = main ] || continue ;;
+				ra[0-9]*|rai[0-9]*|rax[0-9]*|apcli*|wds*) [ $pass = vif ] || continue ;;
+				*) continue ;;
+			esac
+			f=$(cat "/sys/class/net/$n/flags" 2>/dev/null)
+			[ -n "$f" ] && [ $((f & 1)) -eq 1 ] || continue
+			flog "down $n"
+			echo "$n" >> "$WIFIDOWN"
+			ifconfig "$n" down 2>/dev/null
+		done
+	done
+}
+
+# 失败提示里带上占内存最多的几个进程, 用户知道该关什么
+mem_detail() { # <需要> <可用>
+	local top
+	top=$(cat /proc/[0-9]*/status 2>/dev/null |
+		awk '$1 == "Name:" { n = $2 } $1 == "VmRSS:" && $2 >= 8192 { printf "%d %s\n", $2 / 1024, n }' |
+		sort -rn | head -n 3 | awk '{ printf "%s%s %dM", (NR > 1 ? ", " : ""), $2, $1 }')
+	printf '需要 %dM 可用内存, 腾完只有 %dM' "$(mbs "$1")" "$(mbs "$2")"
+	[ -n "$top" ] && printf '; 占内存较多: %s' "$top"
+}
+
+restore() {
+	local n p u
+	flog "restore"
+	# 内存里那份是从 SD 拷进来的就删掉(SD 上的还在, 可以直接重试)
+	[ "$COPIED" = 1 ] && rm -f "$RAMFW" "$RAMFW.part"
+	if [ -s "$SWAPS" ]; then
+		while read n u p; do
+			swapon -p "$p" "$n" 2>/dev/null || swapon "$n" 2>/dev/null
+		done < "$SWAPS"
+	fi
+	if [ -s "$WIFIDOWN" ]; then
+		for n in $(sed -n '1!G;h;$p' "$WIFIDOWN"); do ifconfig "$n" up 2>/dev/null; done
+	fi
+	if [ -s "$STOPPED" ]; then
+		for n in $(cat "$STOPPED"); do flog "start $n"; run_to 90 "/etc/init.d/$n" start; done
+	fi
+}
+
+ffail() { # <错误码> [细节]
+	flog "fail $1 $2"
+	echo "$1" > "$UERR"
+	[ -n "$2" ] && echo "$2" > "$UDETAIL"
+	step restore
+	restore
+	echo failed > "$USTATE"
+	rmdir "$LOCKD" 2>/dev/null
+	exit 0
+}
+
+do_flash() {
+	local f want size need floor avail used n u p rc i keep kept out
+	COPIED=0
+	sleep 1
+	f=$(fw)
+	want=$(cat "$TESTED" 2>/dev/null)
+	[ -f "$f" ] && [ -n "$want" ] || ffail not_tested
+	size=$(fsize "$f")
+	# 固件已在内存里只要留余量; 还在 SD 上的, 要再装得下固件本身
+	case "$f" in /tmp/*) need=0 ;; *) need=$size ;; esac
+	floor=$((need + FLOOR))
+	need=$((need + RESERVE))
+	flog "fw=$f size=$(mbs "$size")M need=$(mbs "$need")M floor=$(mbs "$floor")M dry=$FDRY"
+
+	step free_mem
+	drop_caches
+	avail=$(mem_avail); used=$(disk_swap_used)
+	flog "avail=$(mbs "$avail")M disk_swap_used=$(mbs "$used")M"
+	# 1) 不够(关 SD swap 时换出去的页也要收回内存): 先停占内存的插件
+	if [ "$avail" -lt $((need + used)) ]; then
+		step stop_services
+		stop_services 12288 1
+		sleep 2
+		drop_caches
+		avail=$(mem_avail); used=$(disk_swap_used)
+		flog "after stop: avail=$(mbs "$avail")M disk_swap_used=$(mbs "$used")M"
+	fi
+	# 2) 关 SD 上的 swap: 刷写要覆盖它所在的分区, 留着的话换出去的页(可能就是固件)会读到垃圾。
+	#    换出去的量比空闲内存还多时硬关会触发 OOM 乱杀进程, 宁可放弃
+	if [ -n "$(disk_swaps)" ]; then
+		[ $((used + 16 * MB)) -le "$avail" ] || ffail no_mem "$(mem_detail $((used + 16 * MB)) "$avail")"
+		step swapoff
+		disk_swaps > "$SWAPS"
+		while read n u p; do
+			swapoff "$n" 2>>"$FLOG" || ffail swapoff_failed
+		done < "$SWAPS"
+		drop_caches
+		avail=$(mem_avail)
+		flog "after swapoff: avail=$(mbs "$avail")M"
+	fi
+	# 3) 还不够: 关无线(sysupgrade 进 stage2 前本来也要关)
+	if [ "$avail" -lt "$need" ]; then
+		step wifi_down
+		wifi_down
+		sleep 3
+		drop_caches
+		avail=$(mem_avail)
+		flog "after wifi down: avail=$(mbs "$avail")M"
+	fi
+	# 4) 还不够: 再停 4M 以上的非核心服务
+	if [ "$avail" -lt "$need" ]; then
+		step stop_more
+		stop_services 4096 0
+		sleep 2
+		drop_caches
+		avail=$(mem_avail)
+		flog "after stop more: avail=$(mbs "$avail")M"
+	fi
+	[ "$avail" -ge "$floor" ] || ffail no_mem "$(mem_detail "$floor" "$avail")"
+
+	# 5) SD 上的固件拷进内存
+	case "$f" in
+		/tmp/*) ;;
+		*)
+			step copy
+			tmp_ok "$size" || ffail no_mem "$(mem_detail "$floor" "$avail")"
+			COPIED=1
+			cp "$f" "$RAMFW.part" && mv -f "$RAMFW.part" "$RAMFW" || ffail copy_failed
+			echo 1 > /proc/sys/vm/drop_caches
+			f=$RAMFW
+			;;
+	esac
+	step check
+	[ "$(sha256sum "$f" | cut -d' ' -f1)" = "$want" ] || ffail file_changed
+	# 准备期间要是有别的脚本又把 SD swap 挂上了, 再关一次
+	if [ -n "$(disk_swaps)" ]; then
+		disk_swaps >> "$SWAPS"
+		for n in $(disk_swaps | cut -d' ' -f1); do swapoff "$n" 2>>"$FLOG"; done
+		[ -z "$(disk_swaps)" ] || ffail swapoff_failed
+	fi
+	avail=$(mem_avail)
+	flog "ready avail=$(mbs "$avail")M"
+	# 保留包放到最后打: 前面任何一步失败都不会留下带 WiFi 密钥的包
+	keep=$(cat "$UKEEP" 2>/dev/null); kept=""
+	if [ -n "$keep" ]; then
+		step keep
+		[ -x "$KEEPCFG" ] || ffail keep_failed "缺少 $KEEPCFG"
+		out=$("$KEEPCFG" pack "$keep" 2>>"$FLOG")
+		flog "keep pack $keep -> $out"
+		case "$out" in '{"ok":true'*) ;; *) "$KEEPCFG" clear; ffail keep_failed ;; esac
+		kept=$(echo "$out" | jsonfilter -e '@.items[*]' 2>/dev/null | tr '\n' ' ')
+		[ -z "$kept" ] || [ -f "$KEEPTGZ" ] || ffail keep_failed
+	fi
+	if [ "$FDRY" = 1 ]; then
+		[ -x "$KEEPCFG" ] && "$KEEPCFG" clear
+		ffail dry_run "演练完成, 固件载入内存后剩余可用内存 $(mbs "$avail")M, 保留: ${kept:-不保留}"
+	fi
+
+	step flash
+	echo flashing > "$USTATE"
+	if [ -n "$kept" ]; then
+		/sbin/sysupgrade -f "$KEEPTGZ" --ignore-minor-compat-version "$f" >>"$FLOG" 2>&1
+	else
+		/sbin/sysupgrade -n "$f" >>"$FLOG" 2>&1
+	fi
+	rc=$?
+	# 成功时 procd 会把自己换成 upgraded(pid 1), 随后 stage2 杀掉所有进程, 包括这里
+	i=0
+	while [ $i -lt 30 ]; do
+		[ "$(cat /proc/1/comm 2>/dev/null)" = upgraded ] && { sleep 600; exit 0; }
+		sleep 1
+		i=$((i + 1))
+	done
+	# sysupgrade 进 stage2 前会关 ra0/rai0、卸 USB 主控, 无线尽量拉回来, USB 只能靠重启
+	printf '%s\n' ra0 rai0 >> "$WIFIDOWN"
+	[ -x "$KEEPCFG" ] && "$KEEPCFG" clear
+	ffail sysupgrade_failed "sysupgrade rc=$rc"
+}
+
+case "$1" in
+	list)
+		json_init
+		json_add_object info;     json_close_object
+		json_add_object check;    json_close_object
+		json_add_object latest;   json_close_object
+		json_add_object download; json_close_object
+		json_add_object progress; json_close_object
+		json_add_object cancel;   json_close_object
+		json_add_object verify;   json_close_object
+		json_add_object test;     json_close_object
+		json_add_object upgrade;  json_add_string confirm ""; json_add_string keep ""; json_close_object
+		json_add_object keep_probe; json_close_object
+		json_add_object set_auto; json_add_string enable ""; json_close_object
+		json_dump
+		;;
+	call)
+		input=$(cat)
+		[ -n "$input" ] || input='{}'
+		case "$2" in
+			info)     m_info ;;
+			check)    m_check ;;
+			latest)   m_latest ;;
+			download) m_download ;;
+			progress) m_progress ;;
+			cancel)   m_cancel ;;
+			verify)   m_verify ;;
+			test)     m_test ;;
+			upgrade)
+				json_load "$input" 2>/dev/null
+				json_get_var a confirm
+				json_get_var k keep
+				m_upgrade "$a" "$k"
+				;;
+			keep_probe)
+				# 本机能保留哪些项; 没有打包脚本就当不支持
+				if [ -x "$KEEPCFG" ]; then "$KEEPCFG" probe
+				else echo '{"supported":false,"items":[]}'; fi
+				;;
+			set_auto)
+				json_load "$input" 2>/dev/null
+				json_get_var a enable
+				m_set_auto "$a"
+				;;
+			*) err unknown_method ;;
+		esac
+		;;
+	flash|flash-dry)
+		# upgrade 起的后台任务(flash-dry: 命令行演练, 不刷写)
+		FDRY=0
+		if [ "$1" = flash-dry ]; then
+			FDRY=1
+			[ -f "$TESTED" ] || { echo "not tested: download/verify/test first" >&2; exit 1; }
+			mkdir "$LOCKD" 2>/dev/null || { echo "busy" >&2; exit 1; }
+			rm -f "$UERR" "$UDETAIL" "$STOPPED" "$WIFIDOWN" "$SWAPS" "$FLOG"
+			# 第二个参数: 要演练的保留项, 如 wifi,fan
+			case "$2" in *[!a-z,]*) echo "bad keep" >&2; rmdir "$LOCKD"; exit 1 ;; esac
+			printf '%s\n' "$2" > "$UKEEP"
+			echo preparing > "$USTATE"
+		fi
+		do_flash
+		;;
+	cron)
+		# 每小时被叫一次, 按文件头的频率规则决定这次查不查。只更新缓存, 从不下载、从不刷写
+		# 顺手清掉重启后没人认领的 SD 暂存固件(状态在 /tmp, 重启就丢)
+		[ -f "$FWP" ] || { rm -f "$SDD/firmware.bin" "$SDD/firmware.part"; rmdir "$SDD"; } 2>/dev/null
+		auto_on || exit 0
+		[ "$(cut -d. -f1 /proc/uptime)" -ge 300 ] || exit 0
+		now=$(date +%s)
+		[ "$now" -ge "$(cur_build)" ] || exit 0
+		[ $(( now - $(last_ok) )) -ge "$AUTO_EVERY" ] || exit 0
+		do_check
+		;;
+	board)
+		# 给 fancontrol.lua 的插件认证用: 上报机型键
+		board_key
+		;;
+esac
+
+exit 0

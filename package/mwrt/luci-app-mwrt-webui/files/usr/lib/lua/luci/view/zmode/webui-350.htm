@@ -1,0 +1,129 @@
+<%+header%>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OPENWRT WEBUI</title>
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+    }
+
+    #loadingMessage {
+      margin-bottom: 20px;
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: white;
+      z-index: 10;
+    }
+
+    #embeddedPageContainer {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    #embeddedPage {
+      width: 100%;
+      height: 100%;
+      border: none;
+      transform: translateY(-570px);
+    }
+
+    /* s133 和 webui.htm 一样：.container 改纵向 flex、iframe 吃掉剩余高度。
+       手机端 aurora 给 #maincontent 设了 flex:none!important，不撑回去整块只剩 150px 挤在顶部。
+       类名只在本页由下面的脚本加上，别的页面不受影响。 */
+    .main-right:not(#mw-n) > #maincontent.mw-embed-full { padding: 0 !important; flex: 1 1 auto !important; min-height: 0 !important; }
+    .main-right:not(#mw-n) > #maincontent.mw-embed-full > .container.mw-embed-full {
+      display: flex !important;
+      flex-direction: column !important;
+      max-width: none !important;
+      width: auto !important;
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+    .main-right:not(#mw-n) > #maincontent.mw-embed-full > .container.mw-embed-full > h2 { flex: none; margin: 0; }
+    .main-right:not(#mw-n) > #maincontent.mw-embed-full > .container.mw-embed-full > #embeddedPageContainer { flex: 1 1 auto; height: auto; min-height: 0; }
+    /* s146 手机端：同 webui.htm，iframe 做成圆角卡片 */
+    @media (max-width: 768px) {
+      .main-right:not(#mw-n) > #maincontent.mw-embed-full > .container.mw-embed-full > #embeddedPageContainer {
+        margin-top: 6px; border-radius: 16px; isolation: isolate;
+        box-shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 4px 16px rgba(16, 24, 40, .07);
+      }
+      #embeddedPage { border-radius: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <h2 style="background-color: rgb(83, 83, 83); color: white;">蜂窝模组Web管理</h2>
+  <div id="loadingMessage">正在加载API...</div>
+  <div id="embeddedPageContainer">
+    <iframe id="embeddedPage" src="" onload="showHalfPage()"></iframe>
+  </div>
+  <script>
+    function showHalfPage() {
+      document.getElementById('loadingMessage').style.display = 'none';
+      var embeddedPage = document.getElementById('embeddedPage');
+      embeddedPage.style.transform = 'translateY(0)';
+    }
+
+    // s156 内嵌页(http://本机:8889)加载不出来时给出口,不再留一块空白:
+    //   · 用 HTTPS 登录后台时浏览器会按混合内容拦截;8889 被转发/防火墙挡住时同样连不上。
+    //   iframe 跨源读不到状态,改用 no-cors 探测 8889:探测失败就在页面顶部给一条提示+新窗口链接。
+    function showHint(why, u) {
+      if (document.getElementById('webuiHint')) return;
+      var d = document.createElement('div');
+      d.id = 'webuiHint';
+      d.style.cssText = 'position:absolute;top:44px;left:12px;right:12px;z-index:20;padding:10px 14px;border-radius:8px;background:#fff7e6;color:#8a5a00;border:1px solid #ffd591;font-size:14px;line-height:1.7';
+      d.innerHTML = why + (u ? ' <a href="' + u + '" target="_blank" rel="noopener" style="color:#1677ff;font-weight:600">在新窗口打开蜂窝模组WEB界面</a>' : '');
+      document.getElementById('embeddedPageContainer').appendChild(d);
+    }
+
+    // s157 内嵌页走主 uhttpd 的同源入口 /350/(指向 :8889 的同一份文件):
+    //   · 不再依赖 8889 端口可达,HTTPS 访问和远程维护窗口(只代理设备 80 口)都能直接显示;
+    //   · 前端的 WebSocket 地址跟着浏览器所用的主机名走,改 LAN IP 不受影响。
+    function loadIP() {
+      // 首页「短信管理」磁贴(非 5700 模组)带 #/sms/sms 跳进来;只放行小写字母和斜杠组成的短路径(umi 的 hash 路由),
+      // 其余一律回退网络状态页,避免把任意字符串塞进 iframe 地址。
+      var route = /^#(\/[a-z-]{2,14}){1,2}$/.test(location.hash) ? location.hash : '#/network/status';
+      document.getElementById('embeddedPage').src = '/350/' + route;
+    }
+
+    (function () {
+      var box = document.getElementById('embeddedPageContainer').parentElement, mc = document.getElementById('maincontent');
+      box && box.classList.add('mw-embed-full');
+      mc && mc.classList.add('mw-embed-full');
+    })();
+
+    window.onload = function () {
+      loadIP();
+      // 老固件没有 /350/ 入口时退回 8889(过渡);探测不通再给提示
+      fetch('/350/config.json', { cache: 'no-store' })
+        .then(function (r) { if (!r.ok) throw 0; })
+        .catch(function () {
+          var u = 'http://' + window.location.hostname + ':8889/' + (/^#(\/[a-z-]{2,14}){1,2}$/.test(location.hash) ? location.hash : '#/network/status');
+          if (window.location.protocol === 'https:') {
+            showHint('当前是 HTTPS 访问,浏览器会拦截内嵌的 HTTP 页面,请改用 http 访问路由器后台。', u);
+            return;
+          }
+          document.getElementById('embeddedPage').src = u;
+          fetch('http://' + window.location.hostname + ':8889/config.json', { mode: 'no-cors', cache: 'no-store' })
+            .catch(function () { showHint('WEB界面服务(8889 端口)连不上。', u); });
+        });
+      // HTTPS 直连设备时浏览器会拦 ws://;远程维护窗口会自动改道(带 __mwrtDevWs 标记),不提示
+      if (window.location.protocol === 'https:' && !window.__mwrtDevWs) {
+        setTimeout(function () {
+          showHint('当前是 HTTPS 访问,浏览器会拦截模组实时数据连接(ws),部分内容可能显示不出来,请改用 http 访问路由器后台。');
+        }, 1500);
+      }
+    };  </script>
+</body>
+<%+footer%>

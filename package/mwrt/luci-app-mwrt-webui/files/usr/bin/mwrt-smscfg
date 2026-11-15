@@ -1,0 +1,631 @@
+#!/bin/sh
+# mwrt-smscfg: 5700 模组「短信设置」的设备端执行器 (LuCI 蜂窝 -> 短信管理 -> 设置 调用)。
+#
+# 对应 5700 WEBUI 的 SMS/Settings 页, AT 序列逐条照抄那个页面的压缩源码, 差别只有一处:
+# WEBUI 里任何一步失败都不会收尾, 模组会被留在飞行模式(AT+CFUN=0); 这里任何一步失败
+# 都会先 AT+CFUN=1 恢复联网再报错。
+#
+# 所有 AT 一律经 /usr/bin/sendat (带 /tmp/sendat.at.lock 互斥), 不自己开串口。
+# 写操作之间用 mkdir 锁互斥, 同一时刻只允许一个。
+#
+# 子命令 (每个只输出一行 JSON):
+#   get                      读状态: 短信功能(IMS)、短信中心号码、三个存储位置的用量、CFUN
+#   status                   读开关任务进度 (只读状态文件, 不碰 AT 口); 任务仍在跑时才带 task,
+#                            任务结束后 (锁已释放) 带最终状态, 下一次写操作开始时清掉
+#   toggle 1|0               后台执行开/关短信功能, 立即返回, 进度写 /tmp/mwrt-smscfg.state
+#   csca <号码>              设置短信中心号码 (+ 和数字, 3~21 位)
+#   cpms <读> <写> <收>      设置三个存储位置 (SM / ME)
+#   clear                    清空设备上所有短信 (逐存储位置 AT+CMGD=1,4, 结束后还原存储设置)
+#   recover                  模组停在飞行模式时执行 AT+CFUN=1
+#
+# 测试用环境变量: MWRT_SENDAT(替身 sendat)、MWRT_SMSCFG_STATE、MWRT_SMSCFG_LOCK、
+# MWRT_SMSCFG_FAST(非空则跳过所有 sleep)。
+
+SENDAT="${MWRT_SENDAT:-/usr/bin/sendat}"
+STATE="${MWRT_SMSCFG_STATE:-/tmp/mwrt-smscfg.state}"
+LOCKD="${MWRT_SMSCFG_LOCK:-/tmp/mwrt-smscfg.lock}"
+STEPS=5
+TARGET=0
+T0=0
+OFFSENT=0
+ORIG_IMS=""
+ORIG_CEUS=""
+ORIG_PDP=""
+STEP=0
+
+pause() {
+	[ -n "$MWRT_SMSCFG_FAST" ] && return 0
+	sleep "$1"
+}
+
+# ---- AT -----------------------------------------------------------------
+
+# at <命令> [超时秒]: 结果放 AT_OUT, 回包含 OK 且不含 ERROR 才算成功。
+# 这里所有命令都是幂等的(查询、设置、CFUN、CMGD), 空包/串线时重试是安全的
+# (见记忆 webuiserver-sendat-atdaemon-race: sendat 偶发拿到空回包)。
+# 第三个参数是最多尝试次数, 默认 3; 耗时长的命令(CMGD)传 1, 免得一次失败拖几分钟。
+at() {
+	_try=0
+	_max="${3:-3}"
+	while [ "$_try" -lt "$_max" ]; do
+		_try=$((_try + 1))
+		AT_OUT=$("$SENDAT" 1 "$1" "${2:-5}" 2>/dev/null)
+		case "$AT_OUT" in
+		*ERROR*) ;;
+		*OK*) return 0 ;;
+		esac
+		[ "$_try" -lt "$_max" ] && pause 1
+	done
+	return 1
+}
+
+parse_ims() {
+	printf '%s\n' "$AT_OUT" | sed -n 's/.*\^IMSSWITCH:[[:space:]]*\([01]\),.*/\1/p' | head -n 1
+}
+
+parse_csca() {
+	printf '%s\n' "$AT_OUT" | sed -n 's/.*+CSCA:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+parse_cfun() {
+	printf '%s\n' "$AT_OUT" | sed -n 's/.*+CFUN:[[:space:]]*\([0-9]*\).*/\1/p' | head -n 1
+}
+
+# 解析 +CPMS: "SM",0,50,"SM",0,50,"SM",0,50 到 C_R C_RU C_RT / C_W.. / C_N..
+parse_cpms() {
+	_line=$(printf '%s\n' "$AT_OUT" | sed -n 's/.*+CPMS:[[:space:]]*"\([A-Z_]*\)",\([0-9]*\),\([0-9]*\),"\([A-Z_]*\)",\([0-9]*\),\([0-9]*\),"\([A-Z_]*\)",\([0-9]*\),\([0-9]*\).*/\1 \2 \3 \4 \5 \6 \7 \8 \9/p' | head -n 1)
+	[ -n "$_line" ] || return 1
+	set -- $_line
+	C_R=$1
+	C_RU=$2
+	C_RT=$3
+	C_W=$4
+	C_WU=$5
+	C_WT=$6
+	C_N=$7
+	C_NU=$8
+	C_NT=$9
+	return 0
+}
+
+# ---- 输出 ----------------------------------------------------------------
+
+jerr() {
+	printf '{"ok":false,%s"error":"%s"}\n' "$2" "$1"
+}
+
+jbusy() {
+	printf '{"ok":false,"busy":true,"error":"另一项短信设置操作正在进行，请稍候再试"}\n'
+}
+
+# ---- 互斥锁 --------------------------------------------------------------
+# mkdir 是原子的; 目录里的 pid 文件记持锁进程, 进程没了就算陈旧锁。
+
+lock_alive() {
+	[ -d "$LOCKD" ] || return 1
+	_p=$(cat "$LOCKD/pid" 2>/dev/null)
+	[ -n "$_p" ] && kill -0 "$_p" 2>/dev/null
+}
+
+lock_take() {
+	if mkdir "$LOCKD" 2>/dev/null; then
+		echo $$ >"$LOCKD/pid"
+		return 0
+	fi
+	lock_alive && return 1
+	# 刚 mkdir 还没来得及写 pid 的那一瞬, 给对方 1 秒。
+	if [ -z "$(cat "$LOCKD/pid" 2>/dev/null)" ]; then
+		pause 1
+		lock_alive && return 1
+	fi
+	# 接管陈旧锁: 先原子地 mv 到只属于本进程的名字, 再删。直接 rm -rf 会在
+	# 「两个进程同时判定陈旧」时, 把对方刚建好的新锁一起删掉。
+	_stale="$LOCKD.stale.$$"
+	if mv "$LOCKD" "$_stale" 2>/dev/null; then
+		# 万一搬走的其实是别人刚建好的活锁(极小的竞争窗口), 原样搬回去。
+		_sp=$(cat "$_stale/pid" 2>/dev/null)
+		if [ -n "$_sp" ] && kill -0 "$_sp" 2>/dev/null; then
+			mv "$_stale" "$LOCKD" 2>/dev/null || rm -rf "$_stale"
+			return 1
+		fi
+		rm -rf "$_stale"
+	fi
+	if mkdir "$LOCKD" 2>/dev/null; then
+		echo $$ >"$LOCKD/pid"
+		return 0
+	fi
+	return 1
+}
+
+# 锁是否被「开关任务的 worker」持有 (其余写操作持锁时不算)。
+toggle_running() {
+	lock_alive || return 1
+	_p=$(cat "$LOCKD/pid" 2>/dev/null)
+	# 匹配 "toggle" 同时覆盖 worker(run-toggle) 和刚提交、pid 还没换成 worker 的那一瞬(toggle)。
+	tr '\000' ' ' <"/proc/$_p/cmdline" 2>/dev/null | grep -q 'toggle'
+}
+
+lock_release() {
+	[ "$(cat "$LOCKD/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCKD"
+	return 0
+}
+
+# ---- 开关任务状态文件 ----------------------------------------------------
+
+# st_write <state> <step> <msg> <error>
+st_write() {
+	printf '{"op":"toggle","target":%s,"state":"%s","step":%s,"steps":%s,"msg":"%s","error":"%s","t0":%s,"ts":%s}\n' \
+		"$TARGET" "$1" "$2" "$STEPS" "$3" "$4" "$T0" "$(date +%s)" >"$STATE.$$" &&
+		mv -f "$STATE.$$" "$STATE"
+}
+
+# ---- 恢复联网 ------------------------------------------------------------
+
+# 无论模组当前什么状态, 保证落在 CFUN=1。返回 0 表示已确认。
+recover_cfun() {
+	_n=0
+	while [ "$_n" -lt 3 ]; do
+		_n=$((_n + 1))
+		at 'AT+CFUN=1' 20
+		pause 2
+		if at 'AT+CFUN?' 5 && [ "$(parse_cfun)" = "1" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# ---- 开 / 关短信功能 (后台 worker) --------------------------------------
+
+# 第 2~4 步中途失败时, 尽力把已改动的几项还原成开始前读到的值, 免得留下
+# 「IMS 参数清了但开关还开着」这类半截状态。还原本身失败不影响后面的恢复联网。
+rollback_params() {
+	if [ "$STEP" -ge 2 ] && [ -n "$ORIG_PDP" ]; then
+		at "AT+CGDCONT=$ORIG_PDP" 8
+	fi
+	if [ "$STEP" -ge 3 ] && [ -n "$ORIG_CEUS" ]; then
+		at "AT+CEUS=$ORIG_CEUS" 8
+	fi
+	if [ "$STEP" -ge 4 ] && [ -n "$ORIG_IMS" ]; then
+		at "AT^IMSSWITCH=$ORIG_IMS" 8
+	fi
+}
+
+# fail_toggle <原因> [rollback]
+fail_toggle() {
+	_msg="$1"
+	if [ "$OFFSENT" = "1" ]; then
+		if [ "$2" = "rollback" ]; then
+			rollback_params
+			# STEP<2 时还没改过任何参数, 没有东西可还原, 不必提。
+			[ "$STEP" -ge 2 ] && _msg="$_msg，已尝试还原改动"
+		fi
+		if recover_cfun; then
+			_msg="$_msg，已恢复联网"
+		else
+			_msg="$_msg；且恢复联网失败，请点「恢复联网」或手动执行 AT+CFUN=1"
+		fi
+		OFFSENT=0
+	fi
+	st_write failed "$STEP" "操作失败" "$_msg"
+	exit 1
+}
+
+on_signal() {
+	trap '' TERM INT HUP
+	fail_toggle "任务被中止" rollback
+}
+
+# 第 2~4 步每步之前确认模组仍在飞行模式(CFUN=0)。
+# 只读核对 /usr/share/qmodem/modem_dial.sh: check_dial_prepare 在拨号服务(重)启动、
+# 且 SIM/网卡就绪时会发 AT+CFUN=1(见 NOTES 第 10 条)。toggle 期间若被拉回 CFUN=1,
+# 后面的 IMS 参数就会在联网状态下写入, 所以每步前复核, 不对就中止走恢复流程。
+# 返回 0=确认是 0; 1=不是 0; 2=读不到。
+cfun_still_off() {
+	at 'AT+CFUN?' 5 || return 2
+	[ "$(parse_cfun)" = "0" ]
+}
+
+# do_step <序号> <提示> <AT> <超时> <步后等待秒>
+# STEP 记的是「已经开始执行的最后一步」: 前置检查失败时本步还没发, STEP 仍是上一步,
+# 回滚只还原真正改过的项。
+do_step() {
+	if [ "$1" -ge 2 ] && [ "$1" -le 4 ]; then
+		cfun_still_off
+		case $? in
+		0) ;;
+		1) fail_toggle "第 $1 步之前发现模组已退出飞行模式（可能被拨号服务拉回联网），已中止" rollback ;;
+		*) fail_toggle "第 $1 步之前读不到模组的飞行模式状态，已中止" rollback ;;
+		esac
+	fi
+	STEP=$1
+	st_write running "$1" "$2" ""
+	at "$3" "$4" || return 1
+	[ "$5" -gt 0 ] && pause "$5"
+	return 0
+}
+
+run_toggle() {
+	TARGET=$1
+	T0=$2
+	STEP=0
+	# 等父进程把本进程 pid 写进锁(通常是即时的)。
+	_w=0
+	while [ "$(cat "$LOCKD/pid" 2>/dev/null)" != "$$" ]; do
+		_w=$((_w + 1))
+		[ "$_w" -gt 5 ] && exit 1
+		sleep 1
+	done
+	trap lock_release EXIT
+	trap '' PIPE
+	trap on_signal TERM INT HUP
+
+	st_write running 0 "正在读取当前状态…" ""
+	if ! at 'AT^IMSSWITCH?' 5; then
+		fail_toggle "读不到当前短信功能状态，模组没有应答"
+	fi
+	_cur=$(parse_ims)
+	if [ -z "$_cur" ]; then
+		fail_toggle "无法解析当前短信功能状态"
+	fi
+	if [ "$_cur" = "$TARGET" ]; then
+		st_write done "$STEPS" "短信功能已处于目标状态，无需切换" ""
+		exit 0
+	fi
+
+	# 记下开始前的三项原值, 失败时用来还原。读不到的那项就不还原它。
+	ORIG_IMS=$(printf '%s\n' "$AT_OUT" | sed -n 's/.*\^IMSSWITCH:[[:space:]]*\([01]\),\([0-9]*\),\([0-9]*\).*/\1,\2,\3/p' | head -n 1)
+	ORIG_CEUS=""
+	if at 'AT+CEUS?' 5; then
+		ORIG_CEUS=$(printf '%s\n' "$AT_OUT" | sed -n 's/.*+CEUS:[[:space:]]*\([01]\).*/\1/p' | head -n 1)
+	fi
+	ORIG_PDP=""
+	if at 'AT+CGDCONT?' 5; then
+		ORIG_PDP=$(printf '%s\n' "$AT_OUT" | tr -d '\r' | sed -n 's/^+CGDCONT:[[:space:]]*\(5,.*\)$/\1/p' | head -n 1)
+		# 只放行 AT+CGDCONT 参数里会出现的字符, 免得把模组回包原样拼进命令。
+		case "$ORIG_PDP" in
+		*[!A-Za-z0-9\",.:_-]*) ORIG_PDP="" ;;
+		esac
+	fi
+
+	if [ "$TARGET" = "1" ]; then
+		_c2='AT+CGDCONT=5,"IPV4V6","ims","",0,0,0,0,1,1,1,,,,,,0,,0,0,0,0'
+		_c3='AT+CEUS=0'
+		_c4='AT^IMSSWITCH=1,0,0'
+		_m2="正在配置 IMS 参数…"
+		_m3="正在设置 EPS 服务…"
+		_m4="正在开启 IMS 功能…"
+	else
+		_c2='AT+CGDCONT=5,"IPV4V6","","",0,0,0,0,1,1,1,,,,,,0,,0,0,0,0'
+		_c3='AT+CEUS=1'
+		_c4='AT^IMSSWITCH=0,0,0'
+		_m2="正在清除 IMS 参数…"
+		_m3="正在关闭 EPS 服务…"
+		_m4="正在关闭 IMS 功能…"
+	fi
+
+	# 先标记再发: 即便 CFUN=0 的回包丢了, 失败时也会补一次 CFUN=1。
+	OFFSENT=1
+	do_step 1 "正在开启飞行模式…" 'AT+CFUN=0' 20 2 || fail_toggle "开启飞行模式失败"
+	do_step 2 "$_m2" "$_c2" 8 0 || fail_toggle "第 2 步（IMS 参数）失败" rollback
+	do_step 3 "$_m3" "$_c3" 8 1 || fail_toggle "第 3 步（EPS 服务）失败" rollback
+	do_step 4 "$_m4" "$_c4" 8 1 || fail_toggle "第 4 步（IMS 开关）失败" rollback
+	do_step 5 "正在退出飞行模式…" 'AT+CFUN=1' 20 2 || fail_toggle "退出飞行模式失败"
+	OFFSENT=0
+
+	# 照 WEBUI 的做法到这里就算完了, 这里多读一次确认, 模组重新注册网络期间 AT 偶尔不应答。
+	STEP=6
+	st_write running 5 "正在确认状态…" ""
+	_i=0
+	while [ "$_i" -lt 8 ]; do
+		_i=$((_i + 1))
+		pause 2
+		if at 'AT^IMSSWITCH?' 5 && [ "$(parse_ims)" = "$TARGET" ]; then
+			st_write done "$STEPS" "短信功能已$([ "$TARGET" = "1" ] && echo 开启 || echo 关闭)" ""
+			exit 0
+		fi
+	done
+	st_write failed 5 "操作失败" "命令已执行，但短信功能状态没有变成预期值（模组已退出飞行模式），请刷新后重试"
+	exit 1
+}
+
+cmd_toggle() {
+	case "$1" in
+	0 | 1) ;;
+	*)
+		jerr "参数不合法" ""
+		return 1
+		;;
+	esac
+	if ! lock_take; then
+		jbusy
+		return 1
+	fi
+	TARGET=$1
+	T0=$(date +%s)
+	# 先清掉上一次任务留下的状态文件, 免得 get/status 把旧的 done/failed 当成这次的进度。
+	rm -f "$STATE"
+	st_write running 0 "正在准备…" ""
+	"$0" run-toggle "$TARGET" "$T0" </dev/null >/dev/null 2>&1 &
+	echo $! >"$LOCKD/pid"
+	printf '{"ok":true,"started":true}\n'
+	return 0
+}
+
+# 状态文件内容; 只在「该给前端看」时才输出, 否则输出空:
+#   - 状态是 running 且 worker 活着  -> 原样给
+#   - 状态是 running 但 worker 没了  -> 改写成 failed(任务意外中断)
+#   - 状态是 done/failed             -> 只在没有任何写操作持锁时给(最终结果);
+#                                       别的写操作(csca/cpms/clear/recover)持锁时不给,
+#                                       否则前端会拿旧结果当成「当前任务已结束」。
+task_for_view() {
+	_st=""
+	[ -f "$STATE" ] && _st=$(cat "$STATE" 2>/dev/null)
+	case "$_st" in
+	*'"state":"running"'*)
+		if toggle_running; then
+			printf '%s' "$_st"
+		else
+			printf '%s' "$_st" | sed 's/"state":"running"/"state":"failed"/; s/"error":""/"error":"任务意外中断，请刷新状态确认模组是否在飞行模式"/'
+		fi
+		;;
+	*'"state"'*)
+		lock_alive || printf '%s' "$_st"
+		;;
+	esac
+}
+
+cmd_status() {
+	_alive=false
+	lock_alive && _alive=true
+	_t=$(task_for_view)
+	printf '{"ok":true,"busy":%s,"task":%s}\n' "$_alive" "${_t:-null}"
+}
+
+# ---- 读状态 --------------------------------------------------------------
+
+cpms_json() {
+	printf '{"read":{"st":"%s","used":%s,"total":%s},"write":{"st":"%s","used":%s,"total":%s},"recv":{"st":"%s","used":%s,"total":%s}}' \
+		"$C_R" "$C_RU" "$C_RT" "$C_W" "$C_WU" "$C_WT" "$C_N" "$C_NU" "$C_NT"
+}
+
+# 读一项, 模组回了 OK 但解析不出内容(空包/串线)时只再读一次。
+# at() 自己已经对「没应答/ERROR」重试过 3 次, 这里不再叠加, 免得 AT 口真的不通时拖太久。
+get_ims() {
+	_n=0
+	while [ "$_n" -lt 2 ]; do
+		_n=$((_n + 1))
+		at 'AT^IMSSWITCH?' 5 || return 1
+		_v=$(parse_ims)
+		[ -n "$_v" ] && {
+			_ims=$_v
+			_got=1
+			return 0
+		}
+		[ "$_n" -lt 2 ] && pause 1
+	done
+	return 1
+}
+
+get_csca() {
+	_n=0
+	while [ "$_n" -lt 2 ]; do
+		_n=$((_n + 1))
+		at 'AT+CSCA?' 5 || return 1
+		_v=$(parse_csca)
+		[ -n "$_v" ] && {
+			_csca="\"$_v\""
+			_got=1
+			return 0
+		}
+		[ "$_n" -lt 2 ] && pause 1
+	done
+	return 1
+}
+
+get_cpms() {
+	_n=0
+	while [ "$_n" -lt 2 ]; do
+		_n=$((_n + 1))
+		at 'AT+CPMS?' 5 || return 1
+		if parse_cpms; then
+			_cpms=$(cpms_json)
+			_got=1
+			return 0
+		fi
+		[ "$_n" -lt 2 ] && pause 1
+	done
+	return 1
+}
+
+cmd_get() {
+	if lock_alive; then
+		# 只有开关任务确实还在跑才附带进度; 别的写操作持锁时 task 为 null。
+		_t=""
+		toggle_running && _t=$(task_for_view)
+		printf '{"ok":true,"busy":true,"task":%s}\n' "${_t:-null}"
+		return 0
+	fi
+	_ims=null
+	_csca=null
+	_cpms=null
+	_cfun=null
+	_got=0
+	get_ims
+	get_csca
+	get_cpms
+	if at 'AT+CFUN?' 5; then
+		_v=$(parse_cfun)
+		[ -n "$_v" ] && _cfun=$_v
+	fi
+	if [ "$_got" = "0" ]; then
+		jerr "读不到模组的短信设置，AT 口可能正忙或模组还没就绪" '"busy":false,'
+		return 1
+	fi
+	printf '{"ok":true,"busy":false,"ims":%s,"csca":%s,"cpms":%s,"cfun":%s}\n' "$_ims" "$_csca" "$_cpms" "$_cfun"
+}
+
+# ---- 同步写操作 ----------------------------------------------------------
+
+cmd_csca() {
+	_num="$1"
+	case "${_num#+}" in
+	'' | *[!0-9]*)
+		jerr "短信中心号码只能包含数字，开头可以带 +" ""
+		return 1
+		;;
+	esac
+	if [ "${#_num}" -lt 3 ] || [ "${#_num}" -gt 21 ]; then
+		jerr "短信中心号码长度应为 3 到 21 位" ""
+		return 1
+	fi
+	if ! lock_take; then
+		jbusy
+		return 1
+	fi
+	trap lock_release EXIT
+	if ! at "AT+CSCA=\"$_num\"" 8; then
+		jerr "模组拒绝了这个短信中心号码" ""
+		return 1
+	fi
+	_back=null
+	if at 'AT+CSCA?' 5; then
+		_v=$(parse_csca)
+		[ -n "$_v" ] && _back="\"$_v\""
+	fi
+	printf '{"ok":true,"csca":%s}\n' "$_back"
+}
+
+cmd_cpms() {
+	for _s in "$1" "$2" "$3"; do
+		case "$_s" in
+		SM | ME) ;;
+		*)
+			jerr "存储位置只能是 SM（SIM 卡）或 ME（模组）" ""
+			return 1
+			;;
+		esac
+	done
+	if ! lock_take; then
+		jbusy
+		return 1
+	fi
+	trap lock_release EXIT
+	at 'AT+CMGF=0' 5
+	if ! at "AT+CPMS=\"$1\",\"$2\",\"$3\"" 8; then
+		jerr "模组拒绝了这组存储设置" ""
+		return 1
+	fi
+	_cp=null
+	if at 'AT+CPMS?' 5 && parse_cpms; then
+		_cp=$(cpms_json)
+	fi
+	printf '{"ok":true,"cpms":%s}\n' "$_cp"
+}
+
+jlist() {
+	_sep=""
+	for _x in $1; do
+		printf '%s"%s"' "$_sep" "$_x"
+		_sep=,
+	done
+}
+
+cmd_clear() {
+	if ! lock_take; then
+		jbusy
+		return 1
+	fi
+	trap lock_release EXIT
+	at 'AT+CMGF=0' 5 1
+	if ! at 'AT+CPMS?' 5 || ! parse_cpms; then
+		jerr "读不到当前存储配置，没有执行清空" ""
+		return 1
+	fi
+	_uniq=""
+	for _s in $C_R $C_W $C_N; do
+		case " $_uniq " in
+		*" $_s "*) ;;
+		*) _uniq="$_uniq $_s" ;;
+		esac
+	done
+	_cleared=""
+	_failed=""
+	for _s in $_uniq; do
+		case "$_s" in
+		SM | ME) ;;
+		*)
+			_failed="$_failed $_s"
+			continue
+			;;
+		esac
+		at 'AT+CMGF=0' 5 1
+		if at "AT+CPMS=\"$_s\",\"$_s\",\"$_s\"" 8 2; then
+			pause 1
+			# CMGD 只试 1 次、等 40 秒: 清空本身耗时长, 超时多半说明 AT 口卡住, 再试 3 次
+			# 只会让整个请求拖过前端的 240 秒上限。它是幂等的, 失败会列进 failed,
+			# 用户再点一次即可。
+			if at 'AT+CMGD=1,4' 40 1; then
+				_cleared="$_cleared $_s"
+			else
+				_failed="$_failed $_s"
+			fi
+		else
+			_failed="$_failed $_s"
+		fi
+		pause 1
+	done
+	# 还原清空前的存储设置(WEBUI 不还原, 会把三项都留在最后清的那个位置)。
+	_rest=true
+	at "AT+CPMS=\"$C_R\",\"$C_W\",\"$C_N\"" 8 2 || _rest=false
+	if [ -z "$_failed" ]; then
+		_ok=true
+	else
+		_ok=false
+	fi
+	printf '{"ok":%s,"cleared":[%s],"failed":[%s],"restored":%s}\n' "$_ok" "$(jlist "$_cleared")" "$(jlist "$_failed")" "$_rest"
+}
+
+cmd_recover() {
+	if ! lock_take; then
+		jbusy
+		return 1
+	fi
+	trap lock_release EXIT
+	if recover_cfun; then
+		printf '{"ok":true,"cfun":1}\n'
+	else
+		jerr "执行 AT+CFUN=1 后模组仍没有恢复，请稍后重试或在串口调试里手动执行" ""
+		return 1
+	fi
+}
+
+# 没有任何串口节点(模组没插/没识别)时直接失败, 不去等 sendat 的锁和超时。
+# 测试时用替身 sendat(MWRT_SENDAT)则跳过这个检查。
+need_modem() {
+	[ -n "$MWRT_SENDAT" ] && return 0
+	for _d in /dev/ttyUSB* /dev/ttyACM*; do
+		[ -c "$_d" ] && return 0
+	done
+	jerr "没有检测到模组，请确认模组已插好并识别" '"busy":false,'
+	exit 1
+}
+
+case "$1" in
+get | toggle | csca | cpms | clear | recover) need_modem ;;
+esac
+
+case "$1" in
+get) cmd_get ;;
+status) cmd_status ;;
+toggle) cmd_toggle "$2" ;;
+run-toggle) run_toggle "$2" "$3" ;;
+csca) cmd_csca "$2" ;;
+cpms) cmd_cpms "$2" "$3" "$4" ;;
+clear) cmd_clear ;;
+recover) cmd_recover ;;
+*)
+	jerr "用法: mwrt-smscfg get|status|toggle 1|0|csca <号码>|cpms <读> <写> <收>|clear|recover" ""
+	exit 2
+	;;
+esac

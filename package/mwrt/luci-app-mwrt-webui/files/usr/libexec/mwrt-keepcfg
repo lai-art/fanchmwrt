@@ -1,0 +1,166 @@
+#!/bin/sh
+# /usr/libexec/mwrt-keepcfg —— 刷机 / 在线更新"选择性保留配置"的打包端
+#
+# 不走 sysupgrade 的整份保留(旧配置整份带进新固件是不稳定的主要来源), 只把用户勾选的
+# 几项关键设置抽成 key=base64(值) 的清单 etc/mwrt-keep.conf, 打成 /tmp/mwrt-keep.tgz,
+# 调用方用 `sysupgrade -f /tmp/mwrt-keep.tgz --ignore-minor-compat-version` 带过去。
+# 新固件首启由 /etc/uci-defaults/99z-mwrt-keep-restore 逐项校验后写回, 别的一律不恢复
+# (管理地址、密码、网络、防火墙、插件全部出厂)。
+#
+#   mwrt-keepcfg probe                    本机能保留哪些项(JSON)
+#   mwrt-keepcfg pack wifi,simsel,fan,led 生成配置包(JSON: ok + 实际打进去的项); 一项都没有就删包
+#   mwrt-keepcfg clear                    删包
+#
+# 项: wifi   各频段第一个 AP 的 SSID / 加密方式 / 密钥(不碰 MAC、信道、功率)
+#     simsel 卡槽选择。只有 C2000 三卡槽机型有意义(其余机型只有机身卡槽, 首启 99d 会定成 6);
+#            同时记下当前模组类型, 新固件首启模组类型对不上就不恢复 —— 同一个值在 MT5700
+#            和 FM350 上含义不同(1 对 MT5700 是内置卡, 对 FM350 是外置卡槽1)
+#     fan    风扇定时(mwrt_fan.main) + 手动档位(/etc/fanvall 等三个文件)
+#     led    LED 定时 / 手动开关(mwrt_led.main)
+
+OUT=/tmp/mwrt-keep.tgz
+
+lc() { tr 'A-Z' 'a-z'; }
+
+is_c2000() {
+	case "$(cat /tmp/sysinfo/model /tmp/sysinfo/board_name 2>/dev/null | lc)" in
+		*c2000*|*c5800*) return 0 ;;	# s197 C5800 也是多卡槽机型, 卡槽选择要能保留
+	esac
+	return 1
+}
+
+# 模组类型只看 USB 厂商号(只读 sysfs, 不发 AT): 还原端首启时 /tmp/modconf.conf 还没生成
+modkind() {
+	local d v
+	for d in /sys/bus/usb/devices/*; do
+		v=$(cat "$d/idVendor" 2>/dev/null) || continue
+		case "$v" in
+			3466) echo mt5700; return ;;
+			0e8d) echo fm350; return ;;
+			2c7c) echo rm520; return ;;
+		esac
+	done
+	echo none
+}
+
+# 当前运行的固件刷写时会不会把配置包带过去: 真正干活的是本机(旧固件)的
+# platform_copy_config, 机型没列进去的话 -f 给的包会被静默丢掉。把函数抠出来,
+# 拷贝动作换成打印标记跑一遍, 不靠维护机型名单。
+can_copy() {
+	(
+		. /lib/functions.sh
+		emmc_copy_config() { echo MWRT_COPY; }
+		CI_METHOD=emmc
+		eval "$(sed -n '/^platform_copy_config()/,/^}/p' /lib/upgrade/platform.sh 2>/dev/null)"
+		type platform_copy_config >/dev/null 2>&1 || exit 1
+		platform_copy_config
+	) 2>/dev/null | grep -q MWRT_COPY
+}
+
+has_wifi() { uci -q show wireless | grep -q '=wifi-iface$'; }
+has_fan() { [ -f /etc/config/mwrt_fan ] || [ -f /etc/fanvall ]; }
+has_led() { [ -f /etc/config/mwrt_led ]; }
+
+avail_items() {
+	local l=""
+	has_wifi && l="$l wifi"
+	is_c2000 && [ "$(modkind)" != none ] && l="$l simsel"
+	has_fan && l="$l fan"
+	has_led && l="$l led"
+	echo $l
+}
+
+json_list() { # 词 -> "a","b"
+	local o="" w
+	for w in "$@"; do o="$o${o:+,}\"$w\""; done
+	printf '%s' "$o"
+}
+
+cmd_probe() {
+	local sup=false
+	can_copy && sup=true
+	printf '{"supported":%s,"items":[%s]}\n' "$sup" "$(json_list $(avail_items))"
+}
+
+put() { printf '%s=%s\n' "$1" "$(printf '%s' "$2" | base64 -w0)" >> "$F"; }
+
+save_wifi() {
+	local s m dev band seen=" " n=1
+	for s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		m=$(uci -q get "wireless.$s.mode")
+		[ "${m:-ap}" = ap ] || continue
+		dev=$(uci -q get "wireless.$s.device")
+		band=$(uci -q get "wireless.$dev.band")
+		case "$band" in 2g|5g|6g) ;; *) continue ;; esac
+		case "$seen" in *" $band "*) continue ;; esac
+		[ -n "$(uci -q get "wireless.$s.ssid")" ] || continue
+		seen="$seen$band "
+		put "wifi_${band}_ssid" "$(uci -q get "wireless.$s.ssid")"
+		put "wifi_${band}_enc" "$(uci -q get "wireless.$s.encryption")"
+		put "wifi_${band}_key" "$(uci -q get "wireless.$s.key")"
+		n=0
+	done
+	return $n
+}
+
+save_simsel() {
+	local v k
+	is_c2000 || return 1
+	k=$(modkind)
+	[ "$k" != none ] || return 1
+	v=$(uci -q get mwrt.@ndis[0].simsel)
+	[ -n "$v" ] || return 1
+	put simsel "$v"
+	put simsel_mod "$k"
+}
+
+save_fan() {
+	local k
+	has_fan || return 1
+	for k in enabled starttime endtime gear pwm tempmax weekdays; do
+		put "fan_$k" "$(uci -q get "mwrt_fan.main.$k")"
+	done
+	put fan_fanvall "$(cat /etc/fanvall 2>/dev/null)"
+	put fan_speed "$(cat /usr/bin/fanspeed.conf 2>/dev/null)"
+	put fan_src "$(cat /etc/fanvallv.conf 2>/dev/null)"
+}
+
+save_led() {
+	local k
+	has_led || return 1
+	for k in enabled mode starttime endtime weekdays leds manual; do
+		put "led_$k" "$(uci -q get "mwrt_led.main.$k")"
+	done
+}
+
+cmd_pack() {
+	local want=" $(echo "$*" | tr ',' ' ') " done="" it W
+	rm -f "$OUT" "$OUT.part"
+	umask 077
+	W=$(mktemp -d /tmp/mwrt-keep.XXXXXX) || { echo '{"ok":false,"error":"pack_failed"}'; exit 1; }
+	mkdir -p "$W/etc"
+	F=$W/etc/mwrt-keep.conf
+	put ver 1
+	put model "$(cat /tmp/sysinfo/model 2>/dev/null)"
+	for it in wifi simsel fan led; do
+		case "$want" in *" $it "*) ;; *) continue ;; esac
+		"save_$it" && done="$done $it"
+	done
+	if [ -n "$done" ]; then
+		put items "${done# }"
+		if ! tar -czf "$OUT.part" -C "$W" etc/mwrt-keep.conf 2>/dev/null || ! mv -f "$OUT.part" "$OUT"; then
+			rm -rf "$W" "$OUT.part" "$OUT"
+			echo '{"ok":false,"error":"pack_failed"}'
+			exit 1
+		fi
+	fi
+	rm -rf "$W"
+	printf '{"ok":true,"items":[%s]}\n' "$(json_list $done)"
+}
+
+case "$1" in
+	probe) cmd_probe ;;
+	pack)  shift; cmd_pack "$@" ;;
+	clear) rm -f "$OUT" "$OUT.part" ;;
+	*)     echo "usage: ${0##*/} {probe|pack item[,item...]|clear}" >&2; exit 1 ;;
+esac

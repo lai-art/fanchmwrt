@@ -1,0 +1,24 @@
+#!/bin/sh
+# USB 网卡 / 手机数据线共享的插拔触发(取代原来 usbwan.sh 每 10 秒轮询的死循环)。
+# 网口 add / remove 时才跑一次 /usr/bin/mwrt-usbnic, 平时没有任何进程。
+# 开机时 udevtrigger 会把已经插着的口补发一遍 add, 所以开机拾取也走这里。
+# 这个文件由 hotplug-call 在子 shell 里 source, 不能阻塞: 实际工作放后台。
+# 先用两个 test 把明显无关的事件挡掉, 不为它们起进程:
+#   add    只管有 device 链接的口(虚拟口 br-lan / pppoe-* / lo 都没有);
+#   remove 口已经消失看不到 sysfs, 只挡明显的虚拟口, 其余交给 unplug 对账(见下)。
+[ -x /usr/bin/mwrt-usbnic ] || return 0
+[ -n "$DEVICENAME" ] || return 0
+case "$ACTION" in
+	add)
+		[ -e "/sys/class/net/$DEVICENAME/device" ] || return 0
+		/usr/bin/mwrt-usbnic plug "$DEVICENAME" >/dev/null 2>&1 &
+		;;
+	remove)
+		# 不能只看有没有记录: plug 正在跑、还没写记录时口就被拔了,这里若丢掉 remove,
+		# plug 随后写下的记录再也没人清(幽灵记录)。无条件交给 unplug, 它排在 plug 之后
+		# (同一把锁),对账时发现口已不在就会清掉。明显的虚拟口不起进程。
+		case "$DEVICENAME" in lo|br-*|pppoe-*|ifb*|gre*|ip6*|sit*|tun*|wg*) return 0 ;; esac
+		/usr/bin/mwrt-usbnic unplug "$DEVICENAME" >/dev/null 2>&1 &
+		;;
+esac
+return 0

@@ -1,0 +1,96 @@
+#!/bin/sh
+# webuiserver 的 sendat shim:把 AT 改走 ubus at-daemon。
+#
+# webuiserver(SERIAL.MODE=sendat)每条 AT 都 popen `sendat <n> '<AT>'`,
+# 用的是相对名,所以靠 /etc/init.d/modemwebui 前置的 PATH 落到这里,
+# 系统里其他调 /usr/bin/sendat 的进程不受影响。
+#
+# 为什么不直接用 /usr/bin/sendat:
+#   板上 ubus-at-daemon 常开 AT 口(ttyUSB1)在读,它不认 /tmp/sendat.at.lock。
+#   sendat 直开串口写完指令,回包偶尔被 at-daemon 先读走,sendat 就空等满 3s
+#   返回空串(实测 45 次里 3 次)。前端每条指令只等 1s,超时那条的迟到回包
+#   会被塞给下一条,之后整页数据错位一格 —— 这就是 WEBUI 又慢又乱跳的根因。
+#   走 at-daemon 自己的 sendat 方法:和 qmodem 同一条队列串行,实测 60 条
+#   全成功、单条 35~65ms,回包格式和 /usr/bin/sendat 逐字一致(含 ERROR)。
+#
+# 兜底:取不到端口、ubus 调用失败、指令里有控制字符(短信 PDU 的 Ctrl-Z
+# 之类,塞不进 JSON)时,一律原样 exec /usr/bin/sendat,行为退回改之前。
+cmd="$2"
+to="${3:-3}"; to="${to%.*}"
+case "$to" in ''|*[!0-9]*) to=3 ;; esac
+[ "$to" -ge 1 ] || to=1
+
+# C5800 接了 AK68 且 ATSD 已通(/tmp/mwrt-ak68.atsd 由 mwrt-ak68 守护立): WEBUI 发的 AT 全部走 ATSD, 发给 AK68 里的模组,
+# 不碰内置模组串口。别的机型、没接 AK68 时没有这个文件, 这一段一行都不生效。
+if [ -e /tmp/mwrt-ak68.atsd ] && [ -n "$cmd" ]; then
+	r=$(/usr/bin/mwrt-akat "$cmd" "$to")
+	printf '%s\n' "$r"
+	exit 0
+fi
+
+[ -n "$cmd" ] || exec /usr/bin/sendat "$@"
+[ -z "$(printf '%s' "$cmd" | tr -d '\040-\176')" ] || exec /usr/bin/sendat "$@"
+
+port="$(ubus -t 2 call at-daemon list 2>/dev/null | jsonfilter -e '@.ports[0].port' 2>/dev/null)"
+[ -n "$port" ] || port="$(uci -q show qmodem | sed -n "s/^qmodem\.[^.]*\.at_port='\(.*\)'$/\1/p" | head -n1)"
+if [ -z "$port" ]; then
+	# s199 转网口机型(C5800/C8)镜像里没有 qmodem 也没有 at-daemon: webuiserver 拿不到 at_port 就传 0,
+	# 而 5700 的 AT 口是 ttyUSB1(ttyUSB0 是诊断口, 不回包)。这里改写成 1 再交给 /usr/bin/sendat 直开串口。
+	if [ "$1" = 0 ] && [ -e /dev/ttyUSB1 ]; then
+		case "$(/bin/cat /tmp/sysinfo/board_name /tmp/sysinfo/model 2>/dev/null | tr 'A-Z' 'a-z')" in   # 必须 /bin/cat: 本目录有个 cat shim 会把 board_name 伪装成 H5000M
+			*c5800*|*c8-668*|*c8-688*|*c8-5800*) shift; exec /usr/bin/sendat 1 "$@" ;;
+		esac
+	fi
+	exec /usr/bin/sendat "$@"
+fi
+
+# 串线:qmodem 的 tom_modem 不走 at-daemon、自己直开 ttyUSB1(uci use_ubus 没开),
+# at-daemon 常驻在读同一个口,两边的回包会被对方读走 —— 这条指令可能拿回
+# tom_modem 那条的 +CGPADDR/+CPMS,或者别人的裸 OK。实测 tom_modem 并发连发时
+# 约 5/60 条串线。两层处理:
+#  1) 和 tom_modem 包装(/usr/bin/tom_modem)、/usr/bin/sendat 拿同一把
+#     /tmp/sendat.at.lock 错开。busybox flock 没有 -w、ash 的 sleep 只认整数:
+#     后台 flock + 1s 看门狗,等不到就不等了照发。tom_modem 正常一条 ~100ms;
+#     等不到通常是它的回包已经被 at-daemon 吃了,再等也白等,交给第 2 层。
+#     看门狗子 shell 必须 9>&-,否则它留下的 sleep 会继续攥着锁。
+#  2) 回包校验,只管纯查询(以 ? 结尾,重发无副作用;设置/执行类指令重发可能
+#     重复生效,不碰):回包里只有别的指令的 +XXX:/^XXX: 行,或者既没有自己的
+#     前缀行也不是 ERROR,判为串线,重发一次。空回包(超时)不重发。
+#     最坏 1s 等锁 + 一次快速错包 + 3s 重发,仍在前端 6s 超时以内。
+# 先用 : >> 试一下能不能开:exec 重定向失败会让非交互 sh 直接退出。
+if : >>/tmp/sendat.at.lock 2>/dev/null; then
+	exec 9>>/tmp/sendat.at.lock
+	flock -x 9 2>/dev/null & fp=$!
+	( trap 'kill $s 2>/dev/null; exit 0' TERM; sleep 1 & s=$!; wait $s && kill $fp ) 9>&- >/dev/null 2>&1 &
+	kp=$!
+	wait $fp 2>/dev/null
+	kill $kp 2>/dev/null
+fi
+
+esc=$(printf '%s' "$cmd" | sed 's/\\/\\\\/g; s/"/\\"/g')
+send() {
+	out=$(ubus -t $((to + 3)) call at-daemon sendat "{\"at_port\":\"$port\",\"at_cmd\":\"$esc\",\"timeout\":$to}" 2>/dev/null) || return 1
+	resp=$(printf '%s' "$out" | jsonfilter -e '@.response' 2>/dev/null)
+	[ -n "$resp" ] || resp=$(printf '%s' "$out" | jsonfilter -e '@.partial_response' 2>/dev/null)
+	return 0
+}
+# 指令名: AT^HCSQ? → ^HCSQ, AT+CGPADDR=1 → +CGPADDR
+name=$(printf '%s' "$cmd" | tr a-z A-Z); name=${name#AT}; name=${name%%[=?]*}
+crossed() {
+	[ -n "$resp" ] || return 1
+	case "$cmd" in *'?') ;; *) return 1 ;; esac
+	case "$name" in [+^]?*) ;; *) return 1 ;; esac
+	got=$(printf '%s\n' "$resp" | tr -d '\r' | sed -n 's/^\([+^][A-Za-z0-9]*\):.*/\1/p' | tr a-z A-Z)
+	for n in $got; do [ "$n" = "$name" ] && return 1; done
+	[ -n "$got" ] && return 0
+	case "$resp" in *ERROR*) return 1 ;; esac
+	return 0
+}
+
+# 兜底 exec 前先关 9:/usr/bin/sendat 会自己另开一份去抢同一把锁,继承着就成了自己等自己。
+send || { exec 9>&-; exec /usr/bin/sendat "$@"; }
+if crossed; then
+	first=$resp
+	send || resp=$first
+fi
+printf '%s\n' "$resp"

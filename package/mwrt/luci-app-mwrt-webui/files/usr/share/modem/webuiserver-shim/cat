@@ -1,0 +1,22 @@
+#!/bin/sh
+# webuiserver 的机型放行 shim。
+#
+# /usr/bin/webuiserver 启动时会跑 `cat /tmp/sysinfo/board_name`,只认两个值:
+#   hiveton,h5000m   (H5000M 原厂)
+#   Airpi,emmc-16g
+# 其他机型它不打印任何错误,直接 exit 1。C2000MAX/Ultra 的 board_name 是
+# NRadio-C2000MAX-Ultra,所以原样跑必然起不来。
+#
+# 这里只对 /tmp/sysinfo/board_name 这一个路径作假,其余参数一律原样转给
+# /bin/cat,而且只在 modemwebui 这个 procd 实例的 PATH 里前置这个目录
+# (见 /etc/init.d/modemwebui),不影响系统里任何其他进程。
+#
+# 之所以不改二进制:那是上游产物,改了之后换机型要重新改,而且 md5 对不上
+# 以后没法和原厂固件比对。这一层 shim 是可读的,病因写在这里。
+case "$1" in
+    /tmp/sysinfo/board_name)
+        echo "hiveton,h5000m"
+        exit 0
+        ;;
+esac
+exec /bin/cat "$@"

@@ -1,0 +1,944 @@
+<%+header%>
+
+<%
+-- 短信转发(MT5700M-CN 专用,后端 /usr/bin/smsforward)。
+--
+-- 2026-10-11 重做外观,表单字段名、元素 id、内联 onclick 调用的全局函数一律没改,
+-- 控制器 controller/smsforward.lua 不用动。顺手修了两处:
+--   1. 隐藏域 enable 原来写成 enable == ' 1'(多一个空格),永远是 '0' —— 已开启的
+--      转发只要点一次「保存并应用」就被悄悄关掉。
+--   2. 回显的密钥/标题没转义,值里带引号会把 value="" 截断。
+--
+-- 配色跟着 argon 走:强调色取主题的 --primary,深浅色看页面背景的实际明暗 ——
+-- 不能问 prefers-color-scheme,本机浅色皮把主题按在浅色上,跟系统走会出现浅色
+-- 页面里一块黑卡片(改之前就是这样)。
+
+-- 推送渠道:值 = uci push_type,顺序和 togglePushConfig() 里的行一一对应。
+local CHANNELS = {
+	{ "0", "pushplus.png",   translate("PushPlus") },
+	{ "1", "wxpusher.png",   translate("WxPusher") },
+	{ "2", "pushdeer.png",   translate("PushDeer") },
+	{ "3", "wxwork.png",     translate("WxWork") },
+	{ "4", "bark.png",       translate("Bark") },
+	{ "5", "dingtalk.png",   translate("DingTalk") },
+	{ "6", "feishu.png",     translate("Feishu") },
+	{ "7", "iyuu.png",       translate("IYUU") },
+	{ "8", "telegram.png",   translate("Telegram") },
+	{ "9", "serverchan.png", translate("ServerChan") },
+}
+local cur = CHANNELS[1]
+for _, c in ipairs(CHANNELS) do
+	if c[1] == push_type then cur = c end
+end
+
+-- 已保存的密钥只露首尾各 4 位。控制器按 ^....%*+....$ 认出"没改过",原样保留旧值。
+-- 8 位及以下没法遮(原写法会把 6 位的值拼成 8 位的错值再存回去),直接回显。
+local function masked(v)
+	if not v or #v == 0 then return "" end
+	if #v <= 8 then return pcdata(v) end
+	return pcdata(v:sub(1, 4) .. string.rep("*", #v - 8) .. v:sub(-4))
+end
+
+local on = (enable == "1")
+%>
+
+<style>
+.smsfwd {
+	--sf-accent: #388087;
+	--sf-accent-soft: rgba(56, 128, 135, .1);
+	--sf-on-accent: #fff;
+	--sf-danger: #e35d6a;
+	--sf-danger-soft: rgba(227, 93, 106, .1);
+	--sf-ok: #23955c;
+	--sf-ok-soft: rgba(35, 149, 92, .11);
+	--sf-warn: #d4911c;
+	--sf-warn-soft: rgba(232, 166, 48, .1);
+	--sf-warn-line: rgba(232, 166, 48, .3);
+	--sf-card: #fff;
+	--sf-field: #f6f8fa;
+	--sf-line: rgba(15, 23, 32, .08);
+	--sf-line-strong: rgba(15, 23, 32, .14);
+	--sf-txt: #1c2430;
+	--sf-dim: #77828f;
+	--sf-hover: rgba(15, 23, 32, .035);
+	--sf-track: rgba(15, 23, 32, .18);
+	--sf-shadow: 0 1px 2px rgba(15, 23, 32, .04), 0 10px 28px -20px rgba(15, 23, 32, .25);
+	/* 随浏览器宽度缩放(s40):argon 把 html 字号 !important 钉在 15px,rem 不会跟着窗口变,
+	   这页的字号和间距统一挂在 --sf-u(= 基准字号 / 13)上,按视口宽度线性插值:
+	   ≤ 约 900px 时基准 12px,1280 约 13px,1440 约 13.6px,≥ 1920 封顶 15px。
+	   --sf-sp 是间距单位,在 1300px 宽附近等于原来的 1rem(15px)。 */
+	--sf-u: clamp(.923px, .0246vw + .692px, 1.154px);
+	--sf-sp: calc(15 * var(--sf-u));
+	color: var(--sf-txt);
+	font-size: calc(13 * var(--sf-u));
+	line-height: 1.6;
+}
+
+/* 深色由脚本按页面背景判定后加 .is-dark,见下面的 smsfwdTheme()。 */
+.smsfwd.is-dark {
+	--sf-accent: #2bffc6;
+	--sf-accent-soft: rgba(43, 255, 198, .1);
+	--sf-on-accent: #06231d;
+	--sf-danger: #ff7d60;
+	--sf-danger-soft: rgba(255, 125, 96, .12);
+	--sf-ok: #3fd68a;
+	--sf-ok-soft: rgba(63, 214, 138, .12);
+	--sf-warn: #f0b44c;
+	--sf-warn-soft: rgba(240, 180, 76, .08);
+	--sf-warn-line: rgba(240, 180, 76, .25);
+	--sf-card: #151b23;
+	--sf-field: #0f141a;
+	--sf-line: rgba(255, 255, 255, .07);
+	--sf-line-strong: rgba(255, 255, 255, .13);
+	--sf-txt: #e6edf3;
+	--sf-dim: #8b949e;
+	--sf-hover: rgba(255, 255, 255, .04);
+	--sf-track: rgba(255, 255, 255, .2);
+	--sf-shadow: none;
+}
+
+.smsfwd * { box-sizing: border-box; }
+.smsfwd .hidden { display: none !important; }
+
+/* ---- 顶部 ------------------------------------------------------------- */
+
+.smsfwd-head {
+	display: flex;
+	align-items: flex-end;
+	justify-content: space-between;
+	gap: calc(1 * var(--sf-sp));
+	flex-wrap: wrap;
+	margin-bottom: calc(.9 * var(--sf-sp));
+}
+/* argon-global-custom.css 给 h2 挂了白底+左竖条 !important,mwrt-aurora-chrome.css
+   又用 h2:not(#mwrt-nope) 抬到 ID 级写死字色。要「类 + id」(1,1,1)才压得住。 */
+.smsfwd-head #smsfwd-title {
+	margin: 0 !important;
+	padding: 0 !important;
+	font-size: calc(17 * var(--sf-u)) !important;
+	font-weight: 600;
+	letter-spacing: .01em;
+	color: var(--sf-txt) !important;
+	background: none !important;
+	border: 0 !important;
+	border-radius: 0 !important;
+	box-shadow: none !important;
+	text-shadow: none;
+	text-align: left;
+}
+.smsfwd-head p { margin: calc(.2 * var(--sf-sp)) 0 0; color: var(--sf-dim); font-size: calc(12 * var(--sf-u)); }
+.smsfwd-head p.smsfwd-src[hidden] { display: none; }
+.smsfwd-head p.smsfwd-src b { display: inline-block; margin-right: calc(.5 * var(--sf-sp)); padding: 0 calc(.7 * var(--sf-sp)); border-radius: 999px; background: var(--sf-ok-soft); color: var(--sf-ok); font-weight: 600; font-size: calc(11 * var(--sf-u)); line-height: 1.7; }
+
+.smsfwd-state {
+	display: inline-flex;
+	align-items: center;
+	gap: calc(.45 * var(--sf-sp));
+	padding: calc(.28 * var(--sf-sp)) calc(.85 * var(--sf-sp));
+	border: 1px solid var(--sf-line);
+	border-radius: 99px;
+	background: var(--sf-card);
+	color: var(--sf-dim);
+	font-size: calc(12 * var(--sf-u));
+	font-weight: 600;
+	white-space: nowrap;
+}
+.smsfwd-state i {
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: currentColor;
+	opacity: .7;
+}
+.smsfwd-state.is-ok { background: var(--sf-ok-soft); border-color: transparent; color: var(--sf-ok); }
+.smsfwd-state.is-ok i { opacity: 1; animation: smsfwd-pulse 2s ease-out infinite; }
+.smsfwd-state.is-bad { background: var(--sf-danger-soft); border-color: transparent; color: var(--sf-danger); }
+.smsfwd-state.is-bad i { opacity: 1; }
+@keyframes smsfwd-pulse {
+	0% { box-shadow: 0 0 0 0 currentColor; }
+	70%, 100% { box-shadow: 0 0 0 6px transparent; }
+}
+
+.smsfwd-notice {
+	display: flex;
+	align-items: flex-start;
+	gap: calc(.65 * var(--sf-sp));
+	margin-bottom: calc(1 * var(--sf-sp));
+	padding: calc(.7 * var(--sf-sp)) calc(1 * var(--sf-sp));
+	border: 1px solid var(--sf-warn-line);
+	border-radius: 12px;
+	background: var(--sf-warn-soft);
+	font-size: calc(12 * var(--sf-u));
+	line-height: 1.7;
+}
+.smsfwd-notice-icon {
+	flex: 0 0 auto;
+	width: 18px;
+	height: 18px;
+	margin-top: 1px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 50%;
+	background: var(--sf-warn);
+	color: #fff;
+	font-size: calc(11 * var(--sf-u));
+	font-weight: 700;
+	line-height: 1;
+}
+.smsfwd-notice b { font-weight: 600; }
+
+/* ---- 卡片 ------------------------------------------------------------- */
+
+.smsfwd-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+	gap: calc(1 * var(--sf-sp));
+}
+@media (min-width: 1100px) {
+	.smsfwd-grid { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); }
+}
+
+.smsfwd-panel {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	background: var(--sf-card);
+	border: 1px solid var(--sf-line);
+	border-radius: 16px;
+	box-shadow: var(--sf-shadow);
+}
+.smsfwd-panel-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: calc(.8 * var(--sf-sp));
+	flex-wrap: wrap;
+	padding: calc(.85 * var(--sf-sp)) calc(1.2 * var(--sf-sp));
+	border-bottom: 1px solid var(--sf-line);
+}
+.smsfwd-panel-title { font-size: calc(13.5 * var(--sf-u)); font-weight: 600; }
+.smsfwd-panel-sub { display: block; color: var(--sf-dim); font-size: calc(11.5 * var(--sf-u)); font-weight: 400; }
+.smsfwd-panel-body { flex: 1 1 auto; padding: calc(1.1 * var(--sf-sp)) calc(1.2 * var(--sf-sp)); }
+.smsfwd-panel-foot {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: calc(.8 * var(--sf-sp));
+	padding: calc(.8 * var(--sf-sp)) calc(1.2 * var(--sf-sp));
+	border-top: 1px solid var(--sf-line);
+	color: var(--sf-dim);
+	font-size: calc(11.5 * var(--sf-u));
+}
+
+.smsfwd-alert {
+	margin-bottom: calc(1 * var(--sf-sp));
+	padding: calc(.55 * var(--sf-sp)) calc(.9 * var(--sf-sp));
+	border-radius: 10px;
+	background: var(--sf-danger-soft);
+	color: var(--sf-danger);
+	font-size: calc(12 * var(--sf-u));
+}
+
+/* ---- 字段 ------------------------------------------------------------- */
+
+.smsfwd-row {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: calc(1 * var(--sf-sp));
+}
+/* 每种渠道一行,单字段的独占整行,两个字段的对半分。 */
+.smsfwd-cred {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+	gap: calc(1 * var(--sf-sp));
+	margin-top: calc(1.1 * var(--sf-sp));
+	padding-top: calc(1.1 * var(--sf-sp));
+	border-top: 1px dashed var(--sf-line-strong);
+}
+.smsfwd-field { display: flex; flex-direction: column; gap: calc(.35 * var(--sf-sp)); min-width: 0; }
+.smsfwd-label {
+	display: flex;
+	align-items: baseline;
+	gap: calc(.5 * var(--sf-sp));
+	flex-wrap: wrap;
+	margin: 0 0 0 calc(.15 * var(--sf-sp));
+	color: var(--sf-dim);
+	font-size: calc(12 * var(--sf-u));
+	font-weight: 500;
+}
+.smsfwd-err { color: var(--sf-danger); font-size: calc(11.5 * var(--sf-u)); font-weight: 600; }
+.smsfwd-help { margin: 0 0 0 calc(.15 * var(--sf-sp)); color: var(--sf-dim); font-size: calc(11.5 * var(--sf-u)); line-height: 1.55; }
+.smsfwd-help code {
+	padding: 0 .3em;
+	border-radius: 4px;
+	background: var(--sf-hover);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: calc(11 * var(--sf-u));
+}
+.smsfwd-tip { margin: calc(.9 * var(--sf-sp)) 0 0 calc(.15 * var(--sf-sp)); color: var(--sf-dim); font-size: calc(11.5 * var(--sf-u)); }
+
+/* 主题给 input/textarea 的宽度、底色、字色、边框都上了 !important,这几项必须带。 */
+.smsfwd input[type=text], .smsfwd textarea {
+	width: 100% !important;
+	max-width: none !important;
+	margin: 0 !important;
+	padding: calc(.45 * var(--sf-sp)) calc(.95 * var(--sf-sp)) !important;
+	border: 1px solid var(--sf-line-strong) !important;
+	border-radius: 99px !important;
+	background-color: var(--sf-field) !important;
+	color: var(--sf-txt) !important;
+	font-size: calc(12.5 * var(--sf-u)) !important;
+	font-family: inherit;
+	box-shadow: none !important;
+	transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease;
+}
+.smsfwd input[type=text]:focus, .smsfwd textarea:focus {
+	outline: none !important;
+	border-color: var(--sf-accent) !important;
+	background-color: var(--sf-card) !important;
+	box-shadow: 0 0 0 3px var(--sf-accent-soft) !important;
+}
+.smsfwd ::placeholder { color: var(--sf-dim); opacity: .7; }
+
+/* ---- 推送方式下拉 ----------------------------------------------------- */
+
+.smsfwd-select-wrapper { position: relative; }
+/* 真正提交的是这个 <select>,藏起来只当数据源。 */
+.smsfwd-select-wrapper select {
+	position: absolute !important;
+	width: 1px !important;
+	height: 1px !important;
+	margin: 0 !important;
+	padding: 0 !important;
+	border: 0 !important;
+	opacity: 0 !important;
+	pointer-events: none !important;
+	clip: rect(0 0 0 0);
+}
+.smsfwd-select-display {
+	width: 100%;
+	display: flex;
+	align-items: center;
+	gap: calc(.55 * var(--sf-sp));
+	min-height: 34px;
+	margin: 0;
+	padding: calc(.38 * var(--sf-sp)) calc(.95 * var(--sf-sp)) calc(.38 * var(--sf-sp)) calc(.55 * var(--sf-sp));
+	border: 1px solid var(--sf-line-strong);
+	border-radius: 99px;
+	background: var(--sf-field);
+	color: var(--sf-txt);
+	font: inherit;
+	font-size: calc(12.5 * var(--sf-u));
+	text-align: left;
+	cursor: pointer;
+	transition: border-color .16s ease, box-shadow .16s ease;
+}
+.smsfwd-select-display:hover { border-color: var(--sf-accent); }
+.smsfwd-select-display:focus-visible,
+.smsfwd-select-display.open {
+	outline: none;
+	border-color: var(--sf-accent);
+	box-shadow: 0 0 0 3px var(--sf-accent-soft);
+}
+.smsfwd-select-display::after {
+	content: "";
+	width: 6px;
+	height: 6px;
+	margin-left: auto;
+	border-right: 1.5px solid currentColor;
+	border-bottom: 1.5px solid currentColor;
+	opacity: .55;
+	transform: translateY(-2px) rotate(45deg);
+	transition: transform .18s ease;
+}
+.smsfwd-select-display.open::after { transform: translateY(1px) rotate(-135deg); }
+
+.smsfwd-select-icon {
+	width: 22px;
+	height: 22px;
+	flex: 0 0 auto;
+	object-fit: contain;
+	border-radius: 6px;
+}
+
+.smsfwd-select-dropdown {
+	position: absolute;
+	top: calc(100% + 6px);
+	left: 0;
+	right: 0;
+	z-index: 30;
+	display: none;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 2px;
+	max-height: 320px;
+	overflow-y: auto;
+	padding: 6px;
+	background: var(--sf-card);
+	border: 1px solid var(--sf-line-strong);
+	border-radius: 14px;
+	box-shadow: 0 20px 44px -20px rgba(8, 15, 26, .45);
+	animation: smsfwd-drop .16s ease both;
+}
+.smsfwd-select-dropdown.show { display: grid; }
+@keyframes smsfwd-drop { from { opacity: 0; transform: translateY(-4px); } }
+
+.smsfwd-select-option {
+	display: flex;
+	align-items: center;
+	gap: calc(.55 * var(--sf-sp));
+	padding: calc(.45 * var(--sf-sp)) calc(.6 * var(--sf-sp));
+	border-radius: 10px;
+	color: var(--sf-txt);
+	font-size: calc(12.5 * var(--sf-u));
+	cursor: pointer;
+	transition: background .14s ease, color .14s ease;
+}
+.smsfwd-select-option span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.smsfwd-select-option:hover { background: var(--sf-hover); }
+.smsfwd-select-option.selected {
+	background: var(--sf-accent-soft);
+	color: var(--sf-accent);
+	font-weight: 600;
+}
+
+/* ---- 开关 / 按钮 ------------------------------------------------------ */
+
+.smsfwd-switch {
+	display: inline-flex;
+	align-items: center;
+	gap: calc(.55 * var(--sf-sp));
+	margin: 0;
+	padding: calc(.2 * var(--sf-sp)) calc(.1 * var(--sf-sp));
+	border: 0;
+	background: none;
+	color: var(--sf-dim);
+	font: inherit;
+	font-size: calc(12.5 * var(--sf-u));
+	font-weight: 600;
+	cursor: pointer;
+}
+.smsfwd-track {
+	position: relative;
+	flex: 0 0 auto;
+	width: 40px;
+	height: 22px;
+	border-radius: 99px;
+	background: var(--sf-track);
+	transition: background .18s ease;
+}
+.smsfwd-track::after {
+	content: "";
+	position: absolute;
+	top: 3px;
+	left: 3px;
+	width: 16px;
+	height: 16px;
+	border-radius: 50%;
+	background: #fff;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, .25);
+	transition: transform .18s cubic-bezier(.3, .7, .4, 1);
+}
+.smsfwd-switch.on { color: var(--sf-accent); }
+.smsfwd-switch.on .smsfwd-track { background: var(--sf-accent); }
+.smsfwd-switch.on .smsfwd-track::after { transform: translateX(18px); }
+.smsfwd-switch:focus-visible { outline: none; }
+.smsfwd-switch:focus-visible .smsfwd-track { box-shadow: 0 0 0 3px var(--sf-accent-soft); }
+
+.smsfwd-btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: calc(.35 * var(--sf-sp));
+	margin: 0;
+	padding: calc(.42 * var(--sf-sp)) calc(1.05 * var(--sf-sp));
+	border: 1px solid var(--sf-line-strong);
+	border-radius: 99px;
+	background: var(--sf-card);
+	color: var(--sf-txt);
+	font: inherit;
+	font-size: calc(12.5 * var(--sf-u));
+	font-weight: 500;
+	line-height: 1.5;
+	white-space: nowrap;
+	cursor: pointer;
+	transition: background .16s ease, color .16s ease, opacity .16s ease;
+}
+.smsfwd-btn:hover { background: var(--sf-hover); }
+.smsfwd-btn-primary {
+	padding-left: calc(1.4 * var(--sf-sp));
+	padding-right: calc(1.4 * var(--sf-sp));
+	background: var(--sf-accent);
+	border-color: transparent;
+	color: var(--sf-on-accent);
+	font-weight: 600;
+}
+.smsfwd-btn-primary:hover { background: var(--sf-accent); opacity: .88; }
+.smsfwd-btn-primary.is-busy { opacity: .6; pointer-events: none; }
+.smsfwd-btn-quiet { color: var(--sf-danger); }
+.smsfwd-btn-quiet:hover { background: var(--sf-danger-soft); }
+.smsfwd-btn-sm { padding: calc(.3 * var(--sf-sp)) calc(.85 * var(--sf-sp)); font-size: calc(12 * var(--sf-u)); }
+.smsfwd-actions { display: flex; gap: calc(.4 * var(--sf-sp)); }
+
+/* ---- 转发历史 --------------------------------------------------------- */
+
+.smsfwd-hist .smsfwd-panel-body { display: flex; }
+.smsfwd textarea.smsfwd-history-box {
+	flex: 1 1 auto;
+	/* 双栏时左右两卡等高(grid stretch),这里定的高度就是整块的高度:
+	   跟窗口高度走,大屏不再下面空一大截;单栏(<1100)见下面的媒体查询。 */
+	min-height: clamp(260px, calc(100vh - 430px), 760px);
+	padding: calc(.75 * var(--sf-sp)) calc(.95 * var(--sf-sp)) !important;
+	border-radius: 12px !important;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace !important;
+	font-size: calc(12 * var(--sf-u)) !important;
+	line-height: 1.7;
+	white-space: pre-wrap;
+	resize: vertical;
+}
+.smsfwd-credit b { font-weight: 600; color: var(--sf-txt); }
+
+@media (max-width: 1099px) {
+	.smsfwd textarea.smsfwd-history-box { min-height: clamp(200px, 40vh, 420px); }
+}
+/* 平板:侧栏还在、内容区只有 ~580px,渠道下拉两列太挤成一列,头部状态胶囊不另起一行 */
+@media (max-width: 820px) {
+	.smsfwd-head { flex-wrap: nowrap; align-items: flex-start; }
+	.smsfwd-state { margin-top: .15em; }
+}
+@media (max-width: 600px) {
+	.smsfwd-head { align-items: flex-start; }
+	.smsfwd-row { grid-template-columns: minmax(0, 1fr); }
+	.smsfwd-panel-head, .smsfwd-panel-body, .smsfwd-panel-foot { padding-left: calc(.95 * var(--sf-sp)); padding-right: calc(.95 * var(--sf-sp)); }
+	.smsfwd-save-foot { flex-direction: column; align-items: stretch; }
+	.smsfwd-save-foot .smsfwd-btn-primary { width: 100%; padding-top: calc(.55 * var(--sf-sp)); padding-bottom: calc(.55 * var(--sf-sp)); }
+	.smsfwd textarea.smsfwd-history-box { min-height: clamp(180px, 32vh, 320px); }
+	.smsfwd-notice { padding: .6em .8em; }
+	.smsfwd-panel-foot { flex-wrap: wrap; }
+}
+@media (max-width: 420px) {
+	.smsfwd-head { flex-wrap: wrap; }
+	.smsfwd-select-dropdown { grid-template-columns: minmax(0, 1fr); max-height: 50vh; }
+	.smsfwd-cred { grid-template-columns: minmax(0, 1fr); }
+}
+</style>
+
+<div class="smsfwd" id="smsfwd">
+	<div class="smsfwd-head">
+		<div>
+			<h2 id="smsfwd-title"><a id="content" name="content"></a>短信转发</h2>
+			<p>模组收到新短信后，自动推送到你选的渠道（微信、钉钉、Telegram 等）。</p>
+			<p id="smsfwd-src" class="smsfwd-src" hidden></p>
+		</div>
+		<div id="smsforward-status" class="smsfwd-state" role="status" aria-live="polite"><i></i>读取中…</div>
+	</div>
+
+	<div class="smsfwd-notice">
+		<span class="smsfwd-notice-icon" aria-hidden="true">!</span>
+		<div>
+			本页是 MT5700M-CN 专用的短信转发。系统里还有一套 QModem 自带的
+			<b>短信转发（sms_forwarder）</b>，两者都会读取模组短信并推送，
+			<b>请只启用其中一个</b>，同时开会重复推送，也会加剧 AT 串口争用。
+		</div>
+	</div>
+
+	<div class="smsfwd-grid">
+		<form method="post" id="smsfwd-form" class="smsfwd-panel smsfwd-conf" autocomplete="off">
+			<div class="smsfwd-panel-head">
+				<div class="smsfwd-panel-title">
+					推送设置
+					<span class="smsfwd-panel-sub">选择渠道并填写对应的密钥</span>
+				</div>
+				<input type="hidden" id="enable_hidden" name="enable" value="<%=on and '1' or '0'%>" />
+				<button type="button" id="enable_switch" class="smsfwd-switch <%=on and 'on' or 'off'%>"
+				        role="switch" aria-checked="<%=on and 'true' or 'false'%>" aria-label="启用短信转发"
+				        onclick="toggleEnable()">
+					<i class="smsfwd-track" aria-hidden="true"></i>
+					<span id="enable_switch_text"><%=on and '转发已开启' or '转发已关闭'%></span>
+				</button>
+			</div>
+
+			<div class="smsfwd-panel-body">
+				<% if token_error then %>
+				<div class="smsfwd-alert">当前推送方式的必填项没有填写：配置已保存，但转发服务没有重新启动。</div>
+				<% end %>
+
+				<div class="smsfwd-row">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-sms-title">消息标题</label>
+						<input type="text" id="smsfwd-sms-title" name="sms_title" value="<%=pcdata(sms_title)%>"
+						       placeholder="新信息" maxlength="64" />
+					</div>
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="push_type_display">推送方式</label>
+						<div class="smsfwd-select-wrapper">
+							<select name="push_type" id="push_type_select" tabindex="-1" aria-hidden="true"
+							        onchange="togglePushConfig(); updateSelectDisplay();">
+								<% for _, c in ipairs(CHANNELS) do %>
+								<option value="<%=c[1]%>"<%=c[1] == cur[1] and ' selected' or ''%> data-icon="<%=c[2]%>"><%=pcdata(c[3])%></option>
+								<% end %>
+							</select>
+							<button type="button" class="smsfwd-select-display" id="push_type_display"
+							        aria-haspopup="listbox" aria-expanded="false" onclick="toggleSelectDropdown()">
+								<img class="smsfwd-select-icon" id="push_type_icon" src="<%=resource%>/view/smsforward/logo/<%=cur[2]%>" alt="">
+								<span id="push_type_text"><%=pcdata(cur[3])%></span>
+							</button>
+							<div class="smsfwd-select-dropdown" id="push_type_dropdown" role="listbox">
+								<% for _, c in ipairs(CHANNELS) do %>
+								<div class="smsfwd-select-option<%=c[1] == cur[1] and ' selected' or ''%>" role="option"
+								     data-value="<%=c[1]%>" onclick="selectOption(<%=c[1]%>)">
+									<img class="smsfwd-select-icon" src="<%=resource%>/view/smsforward/logo/<%=c[2]%>" alt="">
+									<span><%=pcdata(c[3])%></span>
+								</div>
+								<% end %>
+							</div>
+						</div>
+					</div>
+				</div>
+
+				<!-- 以下每种渠道一行,只显示当前选中的那一行(togglePushConfig) -->
+
+				<div id="pushplus_row" class="smsfwd-cred <%=push_type == '0' and '' or 'hidden'%>">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-pushplus_token"><%:PushPlus Token%>
+							<% if token_error and push_type == '0' then %><span class="smsfwd-err">请填写 Token</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-pushplus_token" name="pushplus_token" spellcheck="false"
+						       value="<%=masked(pushplus_token)%>" placeholder="<%:Your PushPlus Token%>" />
+					</div>
+				</div>
+
+				<div id="wxpusher_row" class="smsfwd-cred <%=push_type == '1' and '' or 'hidden'%>">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-wxpusher_token"><%:WxPusher AppToken%>
+							<% if token_error and push_type == '1' then %><span class="smsfwd-err">请填写 AppToken</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-wxpusher_token" name="wxpusher_token" spellcheck="false"
+						       value="<%=masked(wxpusher_token)%>" placeholder="<%:Your WxPusher AppToken%>" />
+					</div>
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-wxpusher_topicids"><%:WxPusher TopicIds%>
+							<% if token_error and push_type == '1' then %><span class="smsfwd-err">请填写 TopicIds</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-wxpusher_topicids" name="wxpusher_topicids" spellcheck="false"
+						       value="<%=pcdata(wxpusher_topicids)%>" placeholder="<%:Your WxPusher TopicIds%>" />
+					</div>
+				</div>
+
+				<div id="pushdeer_row" class="smsfwd-cred <%=push_type == '2' and '' or 'hidden'%>">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-pushdeer_key"><%:PushDeer Key%>
+							<% if token_error and push_type == '2' then %><span class="smsfwd-err">请填写 Key</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-pushdeer_key" name="pushdeer_key" spellcheck="false"
+						       value="<%=masked(pushdeer_key)%>" placeholder="<%:Your PushDeer Key%>" />
+					</div>
+				</div>
+
+				<div id="wxpusher_webhook_row" class="smsfwd-cred <%=push_type == '3' and '' or 'hidden'%>">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-wxpusher_webhook"><%:WxWork Webhook%>
+							<% if token_error and push_type == '3' then %><span class="smsfwd-err">请填写 Webhook</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-wxpusher_webhook" name="wxpusher_webhook" spellcheck="false"
+						       value="<%=masked(wxpusher_webhook)%>" placeholder="<%:Your WxWork Webhook%>" />
+						<p class="smsfwd-help">只填 Webhook 地址里 <code>key=</code> 后面的部分</p>
+					</div>
+				</div>
+
+				<div id="bark_row" class="smsfwd-cred <%=push_type == '4' and '' or 'hidden'%>">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-bark_did"><%:Bark DID%>
+							<% if token_error and push_type == '4' then %><span class="smsfwd-err">请填写设备 ID</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-bark_did" name="bark_did" spellcheck="false"
+						       value="<%=masked(bark_did)%>" placeholder="<%:Your Bark DID%>" />
+						<p class="smsfwd-help">只填推送地址里 <code>app/</code> 后面的部分</p>
+					</div>
+				</div>
+
+				<div id="dingtalk_row" class="smsfwd-cred <%=push_type == '5' and '' or 'hidden'%>">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-dingtalk_token"><%:DingTalk Token%>
+							<% if token_error and push_type == '5' then %><span class="smsfwd-err">请填写 Token</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-dingtalk_token" name="dingtalk_token" spellcheck="false"
+						       value="<%=masked(dingtalk_token)%>" placeholder="<%:Your DingTalk Token%>" />
+						<p class="smsfwd-help">只填机器人地址里 <code>access_token=</code> 后面的部分</p>
+					</div>
+				</div>
+
+				<div id="feishu_row" class="smsfwd-cred <%=push_type == '6' and '' or 'hidden'%>">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-feishu_webhook"><%:Feishu Webhook%>
+							<% if token_error and push_type == '6' then %><span class="smsfwd-err">请填写 Webhook</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-feishu_webhook" name="feishu_webhook" spellcheck="false"
+						       value="<%=masked(feishu_webhook)%>" placeholder="<%:Your Feishu Webhook%>" />
+						<p class="smsfwd-help">只填 Webhook 地址里 <code>hook/</code> 后面的部分</p>
+					</div>
+				</div>
+
+				<div id="iyuu_row" class="smsfwd-cred <%=push_type == '7' and '' or 'hidden'%>">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-iyuu_token"><%:IYUU Token%>
+							<% if token_error and push_type == '7' then %><span class="smsfwd-err">请填写 Token</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-iyuu_token" name="iyuu_token" spellcheck="false"
+						       value="<%=masked(iyuu_token)%>" placeholder="<%:Your IYUU Token%>" />
+					</div>
+				</div>
+
+				<div id="telegram_row" class="smsfwd-cred <%=push_type == '8' and '' or 'hidden'%>">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-telegram_bot_token"><%:Telegram Bot Token%>
+							<% if token_error and push_type == '8' then %><span class="smsfwd-err">请填写 Bot Token</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-telegram_bot_token" name="telegram_bot_token" spellcheck="false"
+						       value="<%=masked(telegram_bot_token)%>" placeholder="<%:Your Telegram Bot Token%>" />
+					</div>
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-telegram_chat_id"><%:Telegram Chat ID%>
+							<% if token_error and push_type == '8' then %><span class="smsfwd-err">请填写 Chat ID</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-telegram_chat_id" name="telegram_chat_id" spellcheck="false"
+						       value="<%=pcdata(telegram_chat_id)%>" placeholder="<%:Your Telegram Chat ID%>" />
+					</div>
+				</div>
+
+				<div id="serverchan_row" class="smsfwd-cred <%=push_type == '9' and '' or 'hidden'%>">
+					<div class="smsfwd-field">
+						<label class="smsfwd-label" for="smsfwd-f-serverchan_sendkey"><%:ServerChan SendKey%>
+							<% if token_error and push_type == '9' then %><span class="smsfwd-err">请填写 SendKey</span><% end %>
+						</label>
+						<input type="text" id="smsfwd-f-serverchan_sendkey" name="serverchan_sendkey" spellcheck="false"
+						       value="<%=masked(serverchan_sendkey)%>" placeholder="<%:Your ServerChan SendKey%>" />
+					</div>
+				</div>
+
+				<p class="smsfwd-tip">已保存的密钥只显示首尾 4 位，不改动就保留原值；要更换请清空后重新填写。</p>
+			</div>
+
+			<div class="smsfwd-panel-foot smsfwd-save-foot">
+				<span>开关和配置都要点「保存并应用」才会生效</span>
+				<button type="submit" name="cbi.apply" value="1" id="smsfwd-apply" class="smsfwd-btn smsfwd-btn-primary">保存并应用</button>
+			</div>
+		</form>
+
+		<div class="smsfwd-panel smsfwd-hist">
+			<div class="smsfwd-panel-head">
+				<div class="smsfwd-panel-title">
+					转发历史
+					<span class="smsfwd-panel-sub">重启后清空</span>
+				</div>
+				<div class="smsfwd-actions">
+					<button type="button" class="smsfwd-btn smsfwd-btn-sm" onclick="loadHistory()">刷新</button>
+					<button type="button" class="smsfwd-btn smsfwd-btn-sm smsfwd-btn-quiet" onclick="clearHistory()">清空</button>
+				</div>
+			</div>
+			<div class="smsfwd-panel-body">
+				<textarea readonly class="smsfwd-history-box" id="smsfwd-history" placeholder="读取中…"></textarea>
+			</div>
+			<div class="smsfwd-panel-foot">
+				<span class="smsfwd-credit">Powered by <b>@Snowflakes</b> <b>@Mwrt</b></span>
+			</div>
+		</div>
+	</div>
+</div>
+
+<script type="text/javascript">//<![CDATA[
+	var TEXT_ON = '转发已开启';
+	var TEXT_OFF = '转发已关闭';
+	/* 已保存的开关状态(不是页面上还没保存的那个),状态胶囊据此区分「已停用」和「异常未运行」。 */
+	var SMSFWD_ENABLED = <%=on and 'true' or 'false'%>;
+	var SMSFWD_URL = {
+		status:  '<%=luci.dispatcher.build_url("admin", "modem", "smsforward_status")%>',
+		history: '<%=luci.dispatcher.build_url("admin", "modem", "smsforward_history")%>',
+		clear:   '<%=luci.dispatcher.build_url("admin", "modem", "smsforward_clear_history")%>'
+	};
+	var ICON_BASE_PATH = '<%=resource%>/view/smsforward/logo/';
+	/* 顺序 = push_type 的值 0..9 */
+	var PUSH_ROWS = ['pushplus_row', 'wxpusher_row', 'pushdeer_row', 'wxpusher_webhook_row', 'bark_row',
+	                 'dingtalk_row', 'feishu_row', 'iyuu_row', 'telegram_row', 'serverchan_row'];
+
+	function smsfwdBright(rgb) {
+		return (rgb[0] * 299 + rgb[1] * 587 + rgb[2] * 114) / 1000;
+	}
+
+	/* 把任意 CSS 颜色写法(#rgb、颜色名、rgb())统一解析成三个分量。 */
+	function smsfwdRgb(value) {
+		var probe = document.createElement('span');
+		probe.style.cssText = 'display:none;color:' + value;
+		document.body.appendChild(probe);
+		var text = getComputedStyle(probe).color;
+		document.body.removeChild(probe);
+		var m = text.match(/(\d+),\s*(\d+),\s*(\d+)/);
+		return m ? [+m[1], +m[2], +m[3]] : null;
+	}
+
+	/* 深浅色看祖先第一个不透明背景的明暗,不看 prefers-color-scheme。 */
+	function smsfwdTheme() {
+		var root = document.getElementById('smsfwd');
+		var bg = [255, 255, 255];
+		for (var node = root.parentElement; node; node = node.parentElement) {
+			var m = getComputedStyle(node).backgroundColor
+				.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?/);
+			if (m && (m[4] === undefined || +m[4] > 0.1)) { bg = [+m[1], +m[2], +m[3]]; break; }
+		}
+		/* s107: 整站日夜模式开着时认 html[data-darkmode];没有该属性才按背景明暗 */
+		var dm = document.documentElement.getAttribute('data-darkmode');
+		root.classList.toggle('is-dark', dm === 'true' ? true : dm === 'false' ? false : smsfwdBright(bg) < 128);
+
+		/* 强调色跟主题的 --primary 走,「界面修改」换色时这页一起换。 */
+		var primary = (getComputedStyle(document.documentElement).getPropertyValue('--primary') || '').trim();
+		var accent = primary ? smsfwdRgb(primary) : null;
+		if (!accent) return;
+		root.style.setProperty('--sf-accent', 'rgb(' + accent.join(',') + ')');
+		root.style.setProperty('--sf-accent-soft', 'rgba(' + accent.join(',') + ',.12)');
+		root.style.setProperty('--sf-on-accent', smsfwdBright(accent) > 150 ? '#0b1f1a' : '#fff');
+	}
+
+	function updateSelectDisplay() {
+		var select = document.getElementById('push_type_select');
+		var icon = document.getElementById('push_type_icon');
+		var text = document.getElementById('push_type_text');
+		var opt = select.options[select.selectedIndex];
+		if (opt) {
+			icon.src = ICON_BASE_PATH + opt.getAttribute('data-icon');
+			text.textContent = opt.textContent.trim();
+		}
+		var items = document.querySelectorAll('#push_type_dropdown .smsfwd-select-option');
+		for (var i = 0; i < items.length; i++) {
+			var on = items[i].getAttribute('data-value') === select.value;
+			items[i].classList.toggle('selected', on);
+			items[i].setAttribute('aria-selected', on ? 'true' : 'false');
+		}
+	}
+
+	/* 不带参数 = 切换;带 true/false = 强制开/关。 */
+	function toggleSelectDropdown(force) {
+		var dropdown = document.getElementById('push_type_dropdown');
+		var display = document.getElementById('push_type_display');
+		var open = (typeof force === 'boolean') ? force : !dropdown.classList.contains('show');
+		dropdown.classList.toggle('show', open);
+		display.classList.toggle('open', open);
+		display.setAttribute('aria-expanded', open ? 'true' : 'false');
+	}
+
+	function selectOption(value) {
+		var select = document.getElementById('push_type_select');
+		select.value = String(value);
+		toggleSelectDropdown(false);
+		/* onchange 里会调 togglePushConfig() + updateSelectDisplay() */
+		select.dispatchEvent(new Event('change', { bubbles: true }));
+	}
+
+	function togglePushConfig() {
+		var type = document.getElementById('push_type_select').value;
+		for (var i = 0; i < PUSH_ROWS.length; i++) {
+			var row = document.getElementById(PUSH_ROWS[i]);
+			if (row) row.classList.toggle('hidden', String(i) !== type);
+		}
+	}
+
+	function updateStatus() {
+		XHR.get(SMSFWD_URL.status, null, function (x, data) {
+			var el = document.getElementById('smsforward-status');
+			if (!el) return;
+			var running = !!(data && data.running);
+			var label, cls;
+			if (running) { label = '运行中'; cls = 'is-ok'; }
+			else if (SMSFWD_ENABLED) { label = '未运行'; cls = 'is-bad'; }
+			else { label = '已停用'; cls = ''; }
+			el.className = 'smsfwd-state ' + cls;
+			el.innerHTML = '<i></i>' + label;
+			el.title = running ? '转发服务正在运行'
+				: (SMSFWD_ENABLED ? '已开启转发，但服务没有在运行，请检查推送配置后重新保存' : '转发未开启');
+			// C5800: 标明读的是哪张卡的短信(接了 AK68 读 AK68 的卡; 拔掉后自动回内置卡, 两边的转发记录各自独立)
+			var src = document.getElementById('smsfwd-src');
+			if (src) {
+				if (data && data.source === 'ak68') {
+					src.hidden = false;
+					src.className = 'smsfwd-src is-ak';
+					src.innerHTML = '<b>AK68</b> 当前读取外接 AK68 里的 SIM 卡短信；拔掉 AK68 后自动改读内置模组的卡';
+				} else if (data && data.source === 'internal') {
+					src.hidden = false;
+					src.className = 'smsfwd-src';
+					src.innerHTML = '当前读取内置模组的 SIM 卡短信；接入 AK68 后自动改读 AK68 的卡';
+				} else {
+					src.hidden = true;
+				}
+			}
+		});
+	}
+
+	function loadHistory() {
+		var box = document.getElementById('smsfwd-history');
+		box.value = '';
+		box.placeholder = '读取中…';
+		XHR.get(SMSFWD_URL.history, null, function (x, data) {
+			box.value = (data && typeof data === 'string') ? data : (x && x.responseText ? x.responseText : '');
+			box.placeholder = '暂无转发记录';
+			box.scrollTop = box.scrollHeight;
+		});
+	}
+
+	function clearHistory() {
+		if (!confirm('确定清空全部转发历史吗？'))
+			return;
+		XHR.get(SMSFWD_URL.clear, null, function (x, data) {
+			if (data && data.success)
+				document.getElementById('smsfwd-history').value = '';
+		});
+	}
+
+	function toggleEnable() {
+		var btn = document.getElementById('enable_switch');
+		var text = document.getElementById('enable_switch_text');
+		var hidden = document.getElementById('enable_hidden');
+		var on = !btn.classList.contains('on');
+		btn.classList.toggle('on', on);
+		btn.classList.toggle('off', !on);
+		btn.setAttribute('aria-checked', on ? 'true' : 'false');
+		text.textContent = on ? TEXT_ON : TEXT_OFF;
+		hidden.value = on ? '1' : '0';
+	}
+
+	/* 点外面 / 按 Esc 收起下拉 */
+	document.addEventListener('click', function (e) {
+		var wrapper = document.querySelector('.smsfwd-select-wrapper');
+		if (wrapper && !wrapper.contains(e.target))
+			toggleSelectDropdown(false);
+	});
+	document.addEventListener('keydown', function (e) {
+		if (e.key === 'Escape')
+			toggleSelectDropdown(false);
+	});
+
+	document.getElementById('smsfwd-form').addEventListener('submit', function () {
+		/* 不能 disabled:被禁用的提交按钮不进表单,控制器就收不到 cbi.apply。 */
+		var btn = document.getElementById('smsfwd-apply');
+		btn.classList.add('is-busy');
+		btn.textContent = '正在应用…';
+		/* luci-overlay-plugin 本固件没有装,有才弹遮罩。 */
+		if (typeof showLuciOverlay === 'function') {
+			showLuciOverlay({
+				title: '正在应用配置...',
+				messages: ['系统正在重启短信转发服务'],
+				progressDuration: 1,
+				autoHideDelay: 3000
+			});
+		}
+	});
+
+	smsfwdTheme();
+	/* 切换键/别的标签页改了偏好,这里即时换肤 */
+	document.addEventListener('mwrt-theme', smsfwdTheme);
+	updateSelectDisplay();
+	togglePushConfig();
+	updateStatus();
+	loadHistory();
+	setInterval(updateStatus, 5000);
+//]]></script>
+
+<%+footer%>

@@ -1,0 +1,13 @@
+{
+	"admin/system/ota": {
+		"title": "在线更新",
+		"order": 71,
+		"action": {
+			"type": "view",
+			"path": "mwrt/ota"
+		},
+		"depends": {
+			"acl": [ "luci-app-mwrt-ota" ]
+		}
+	}
+}

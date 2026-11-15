@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+# NRadio C5800 only: POE switch + external AK68 auto handling (see /usr/bin/mwrt-ak68). Any other board: nothing starts.
+
+USE_PROCD=1
+START=97
+STOP=10
+
+start_service() {
+	case "$(cat /tmp/sysinfo/board_name 2>/dev/null)|$(cat /tmp/sysinfo/model 2>/dev/null)" in
+		*[Cc]5800*) ;;
+		*) return 0 ;;
+	esac
+	procd_open_instance
+	procd_set_param command /usr/bin/mwrt-ak68 daemon
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}
+
+stop_service() {
+	# the daemon may have the built-in cell interfaces down; bring them back when the service is stopped
+	[ -f /tmp/mwrt-ak68.json ] && grep -q '"cell_stopped":1' /tmp/mwrt-ak68.json && { ifup cell; ifup cellv6; } >/dev/null 2>&1
+	rm -f /tmp/mwrt-ak68.json
+	# ATSD 通道标志随守护一起收(别的机型没有这些文件, 这里什么也不做)
+	if [ -e /tmp/mwrt-ak68.atsdgo ] || [ -e /tmp/mwrt-ak68.atsd ]; then
+		rm -f /tmp/mwrt-ak68.atsd /tmp/mwrt-ak68.atsdgo
+		/etc/init.d/atsd_tools stop >/dev/null 2>&1
+	fi
+}

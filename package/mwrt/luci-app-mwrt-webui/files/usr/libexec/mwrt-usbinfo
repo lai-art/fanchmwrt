@@ -1,0 +1,140 @@
+#!/bin/sh
+# /usr/libexec/mwrt-usbinfo —— 列出外接 USB 设备(根口 + 集线器后面的设备), 一台一行, "|" 分隔:
+#   总线位置|vid|pid|速率Mbps|类型|容量MB|下挂设备数|序列号|厂商|名称
+# 类型: modem(蜂窝模组) nic(USB 以太网卡) tether(手机数据线共享: RNDIS / iPhone)
+#       net(其他带网口的设备, 如 USB 无线网卡) hub(集线器) display(USB 显示适配器)
+#       capture(HDMI 采集卡) camera(UVC 摄像头) audio(USB 声卡/耳机/麦克风)
+#       storage(存储) hid(键鼠) printer bt other
+# audio 判据(s89): 接口类 01 且子类 01(音频控制)或 02(音频流), 或接口下有 sound/card* 节点;
+#       只有子类 03(MIDI)的不算声卡, 归 other。判序: UVC 摄像头 / 显示适配器在前(摄像头自带麦克风不抢),
+#       audio 在 storage / hid 之前(带按键的耳机同时有 03 接口, 不能判成键鼠)。
+# 输出固定 10 列, 不许加列: luci.mwrt-notice 与 router3d-data 都按 IFS='|' 固定变量个数读。
+# (旧版的 video 不再输出, 前端遇到 video 仍按摄像头处理)
+# s91: 集线器后面的设备也单独列出(总线位置形如 1-1.2, 集线器自己仍然保留一行, 下挂数 = 直接下挂台数)。
+#       以前只看根口第一层, 集线器后面接的声卡/摄像头/网卡等都不出现, 首页 USB 芯片按"没接入"显示、
+#       声卡设置进不去。集线器后面的蜂窝模组仍不报(modem 只认根口那一层)。
+# 只读 sysfs, 不发 AT、不开串口。首页设备图(router3d-data, 1.8 秒一轮)和
+# 全局接入通知(luci.mwrt-notice)共用这一份判型, 两边不要各写一套。
+# nic / tether 按网口的驱动分, 清单与 /usr/bin/mwrt-usbnic 的 classify 相同, 两处必须同改。
+# 字符串里的控制字符和 "|" 一律删掉, 调用方按 IFS='|' 读, 空字段不会错位。
+
+D=${MWRT_SYS:-/sys}/bus/usb/devices   # MWRT_SYS 只给测试沙盒用
+
+clean() { tr -d '\000-\037|' < "$1" 2>/dev/null; }
+
+# s208: WH3000 / WH3000 Pro 机身内置一颗 Genesys(05e3) 集线器(USB2 的 1-1 + USB3 的 2-1, 模组就挂在它下面),
+#       根口上永远有它。它不是用户接的设备, 不列出, 否则首页 USB 口一直显示"已接入集线器"、开机还会弹接入通知。
+#       用户在机身 USB 口上再接的集线器 / 设备挂在它下面(1-1.x / 2-1.x), 照常列出。
+#       判据: 机型含 wh3000 + 直挂根口(总线位置里没有 ".") + 集线器类 + 厂商 05e3。MWRT_BOARD 只给测试沙盒用。
+BUILTIN_HUB=0
+case "$(cat "${MWRT_BOARD:-/tmp/sysinfo/board_name}" 2>/dev/null)" in *wh3000*) BUILTIN_HUB=1 ;; esac
+
+for d in "$D"/[0-9]*-[0-9]*; do
+	b=${d##*/}
+	# 1-1:1.0 是接口节点, 不单列; 1-1.2 是集线器下面的设备(s91: 平铺列出, 见文件头)
+	case "$b" in *:*) continue ;; esac
+	[ -r "$d/idVendor" ] || continue
+	nested=0
+	case "$b" in *.*) nested=1 ;; esac
+
+	ty=0; wd=0; nt=0; dr=0; au=0; cls=""; ndrv=""
+	for i in "$d/$b":*; do
+		[ -d "$i" ] || continue
+		for x in "$i"/ttyUSB*; do [ -e "$x" ] && ty=$((ty + 1)); done
+		[ -d "$i/usbmisc" ] && wd=1
+		if [ -d "$i/net" ]; then
+			nt=1
+			[ -n "$ndrv" ] || { ndrv=$(readlink "$i/driver" 2>/dev/null); ndrv=${ndrv##*/}; }
+		fi
+		[ -d "$i/drm" ] && dr=1
+		ic=$(cat "$i/bInterfaceClass" 2>/dev/null)
+		cls="$cls $ic"
+		# 音频: 类 01 + 子类 01/02; 或声卡驱动已在该接口下建出 sound/card*
+		if [ "$ic" = 01 ]; then
+			case "$(cat "$i/bInterfaceSubClass" 2>/dev/null)" in 01|02) au=1 ;; esac
+		fi
+		for x in "$i"/sound/card*; do [ -e "$x" ] && au=1; done
+	done
+
+	# 蜂窝模组: 有 cdc-wdm(QMI/MBIM 控制口), 或者有两个以上 ttyUSB(AT/诊断口)。
+	# 单个 ttyUSB 多半是 USB 转串口线, 归 other。
+	vid=$(clean "$d/idVendor"); pid=$(clean "$d/idProduct")
+	prod=$(clean "$d/product")
+	lp=$(printf '%s' "$prod" | tr 'A-Z' 'a-z')
+
+	t=other
+	if [ "$wd" = 1 ] || [ "$ty" -ge 2 ]; then t=modem
+	elif [ "$nt" = 1 ]; then
+		t=net
+		case "$ndrv" in
+			rndis_host|ipheth) t=tether ;;
+			r8152|r8153_ecm|ax88179_178a|ax88172a|asix|cdc_ether|cdc_ncm|cdc_eem|aqc111|lan78xx|smsc95xx|smsc75xx|dm9601|sr9700|mcs7830|pegasus|rtl8150|ch9200|cdc_subset|net1080|plusb|gl620a|catc|kaweth) t=nic ;;
+		esac
+	elif [ "$(cat "$d/bDeviceClass" 2>/dev/null)" = "09" ]; then t=hub
+	else
+		# UVC(接口类 0e)要先于 01 音频判: 摄像头常自带麦克风接口。
+		# 采集卡也是 UVC, 先按名单/名称挑出来, 剩下的才是摄像头。
+		uvc=0
+		case "$cls " in *" 0e "*) uvc=1 ;; esac
+		# 显示适配器: 厂商号、已知型号、接口下有 drm 节点, 三条可靠度高, 无条件认;
+		# 名称关键词只对非 UVC 设备生效, 免得把叫 "Video Adapter" 的采集卡错认。
+		dsp=0
+		case "$vid" in 17e9) dsp=1 ;; esac
+		case "$vid:$pid" in 090c:0750|1d50:614d|0eb1:0130) dsp=1 ;; esac
+		[ "$dr" = 1 ] && dsp=1
+		if [ "$uvc" = 0 ]; then
+			case "$lp" in
+				*displaylink*|*"usb graphics"*|*"video adapter"*|*"hdmi display"*) dsp=1 ;;
+			esac
+		fi
+		if [ "$dsp" = 1 ]; then t=display
+		elif [ "$uvc" = 1 ]; then
+			t=camera
+			case "$vid:$pid" in 534d:2109|534d:2130|345f:2130|345f:2109) t=capture ;; esac
+			case "$lp" in *capture*|*采集*|*hdmi*) t=capture ;; esac
+		else
+			if [ "$au" = 1 ]; then t=audio
+			else
+				case "$cls " in
+					*" 08 "*) t=storage ;;
+					*" 03 "*) t=hid ;;
+					*" 07 "*) t=printer ;;
+					*" e0 "*) t=bt ;;
+				esac
+			fi
+		fi
+	fi
+
+	# s208: 机身内置集线器不列(见文件头附近 BUILTIN_HUB 说明)
+	[ "$BUILTIN_HUB" = 1 ] && [ "$nested" = 0 ] && [ "$t" = hub ] && [ "$vid" = 05e3 ] && continue
+
+	# 集线器后面的蜂窝模组不报: modem 判定牵着拨号/N5000 转接板在位逻辑, 保持只认根口那一层
+	[ "$nested" = 1 ] && [ "$t" = modem ] && continue
+
+	mb=0
+	if [ "$t" = storage ]; then
+		for s in "$d/$b":*/host*/target*/*/block/*/size; do
+			[ -r "$s" ] || continue
+			mb=$(( $(cat "$s" 2>/dev/null || echo 0) / 2048 ))
+			break
+		done
+	fi
+
+	sub=0
+	if [ "$t" = hub ]; then
+		for c in "$D/$b".[0-9]*; do
+			# 只数直接挂在这台集线器上的: 去掉前缀后不能再有 "." (更深一层) 或 ":" (接口节点)
+			case "${c##*/}" in *:*) continue ;; esac
+			r=${c##*/}; r=${r#"$b".}
+			case "$r" in *.*) continue ;; esac
+			[ -r "$c/idVendor" ] && sub=$((sub + 1))
+		done
+	fi
+
+	spd=$(cat "$d/speed" 2>/dev/null); spd=${spd%%.*}
+	case "$spd" in ''|*[!0-9]*) spd=0 ;; esac
+
+	printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$b" \
+		"$vid" "$pid" "$spd" "$t" "$mb" "$sub" \
+		"$(clean "$d/serial")" "$(clean "$d/manufacturer")" "$prod"
+done

@@ -1,0 +1,1218 @@
+#!/bin/sh
+#
+# /usr/libexec/rpcd/luci.mwrt-notice —— 右上角全局消息中心的数据源
+#
+# 页面每 10 秒问一次, 所以只读文件和 sysfs: 不发 AT、不联网、不 fork 重活。
+# 每条消息: id(稳定标识, 前端按它去重、记已读), level(critical|warn|info),
+#   closable(用户能否关掉), text, link(可选, 前端映射成页面地址)。
+#
+# 现有来源(SIM 和 USB 两条只认 MT5700, 其他模组一律不出):
+#   usb3     刷机后第一次开机模组落在 USB2.0(1-1), mwrt-qmodem-usb3 正在把它
+#            复位到 3.0(2-1)。判据和那个脚本完全一致: 一次性重训还没用掉
+#            (ONCE 标记 != 本镜像), 且模组在 HS 上, 或者已发过复位正离开总线
+#            (含复位后没回来、脚本在断电救援的阶段)。
+#   usb3-lost 断电救援补满了模组还是没回来, 脚本已放弃: 提示重启路由器, 不拦重启。
+#   siminit  mt5700m.sh 正在初始化 SIM 卡(它的锁还活着, 或 simcardstat 停在
+#            初始化态), 且模组对应的网口还没拨上。
+#   swapfile 首次开机 mwrt-swapfile 正在 SD 卡上生成虚拟内存(它的后台进程还活着)。
+#            带 progress(0-100): .tmp 在写按大小折算, 改名后到 swapon 完成前是
+#            "启用中"(f2fs 首次 swapon 要迁移并钉住文件, 要几十秒); 还在开机后
+#            那 60 秒等待里就不带, 前端显示成流动线。SD 卡扩容(mwrt-expand-rootfs)
+#            在 preinit 里就做完了, 网页起来时早已结束, 没有"进行中"可报; 本次
+#            开机真扩了(它留下 EXPAND_MARK)就把扩容结果并进这一条。
+#   ota      cron 已经查到新固件(读 luci.mwrt-ota 的缓存, 不联网)。
+#   sms-* / miss-*  s102: 5700 新短信 / 未接来电(读 mwrt-phoned 的 /tmp/mwrt-phone/events, 见 phone_merge)。
+#            id 形如 sms-<事件id>-<ts> / miss-<事件id>-<ts>(守护重启后事件 id 会重新计数, 所以带 ts); icon=sms|miss,
+#            title=发件人 / 号码, text=摘要(<=80 字), link=sms(短信卡), ts + clock_ok; 最多 5 张, 超出另出一张
+#            id 固定为 sms-more 的汇总卡(rev=超出条数)。受 uci phoneen / phone_note_sms / phone_note_call 控制。
+#            s105: 已读状态在设备端统一记录: /tmp/mwrt-phone/notice.ack(每行一个卡片 id, 由 modem 控制器的 notice_ack 接口经
+#            /usr/libexec/mwrt-notice-ack.uc 追加), 本脚本只读最后 400 行; 已读的短信 / 未接来电不再出卡, 汇总卡只统计
+#            未读超出部分(「另有 N 条未读短信」), 并带 ack=sms_older|older 告诉前端 × 该用哪个服务端范围。
+#            文件缺失 / 损坏 / 过大 / 符号链接都当没有已读记录。
+#            只在 5700 在场时输出; 事件内容只在 ucode 里按 JSON 读, 不经 shell。
+#   ims-off  s103: 5700 在场、phoneen != 0 且 /tmp/mwrt-phone/state.json 的 ims 严格等于 0(短信功能/IMS 关闭)时的提醒卡。
+#            id 固定 ims-off, level=warn, icon=sms, link=smsset(前端跳短信管理设置页)。ims 为 1 / -1 / 文件缺失或损坏不出卡。
+#   port-*   网口插上 / 拔掉网线、USB 口插上 / 拔掉设备的一次性提示(见 port_scan), 可关闭, 150 秒后自动消失。
+#            s88: USB 网卡 / 手机数据线共享的六种事件(nicin niclan nicwan nicoff thrin throff)
+#            由后端的插拔钩子直接写进事件文件, 这里只负责翻译成中文通知(见 nic_event_notice);
+#            这两类设备在检测开关开着时不再走下面 port_scan 的通用 usb / usboff, 免得一次插拔出两条; 开关关着时仍走通用提示。
+#   chat     s155: 故障报修在线聊天里维护人员发来、设备端还没读(chat.ack 之后)的消息 → 置顶一张 id=chat-<报修码> 的卡,
+#            icon=chat, 带 chat:{code,state,ids[未读id,最多50],more,max,online}, text=最新一条的 80 字预览(只读 spool, 不经 shell);
+#            另给顶层 chat:{code,state} 供前端在会话结束 / 换码时清理本地关闭记录。前端再并入浏览器 localStorage 的 seen 重新数未读。
+#
+# reboot_gate: 重启页用。usb3 那条成立时不让重启 —— 复位做到一半重启, 模组会
+#   带着半截状态回来。开机超过 GATE_MAX 秒还没好, 说明重训卡住了(正常最多
+#   六分钟左右, 见 mwrt-qmodem-usb3), 就不再算"切换中", 不拦也不提示。
+
+. /usr/share/libubox/jshn.sh
+
+MT5700_ID="3466:3301"
+USBDEV=/sys/bus/usb/devices
+ONCE=/etc/mwrt-qmodem-usb3.done
+TRIES=/tmp/mwrt-qmodem-usb3.tries
+SIMLOCK=/tmp/rm520n.lock
+SIMSTAT=/tmp/simcardstat
+OTA_LATEST=/tmp/mwrt-ota/latest.json
+# 与 mwrt-swapfile 的 BUSY / SWAP / SIZE_MB 相同, 两边必须一起改
+SWAPBUSY=/tmp/mwrt-swapfile.busy
+SWAPFILE=/overlay/swapfile
+SWAP_MB=512
+# 与 76_expand_rootfs 的 EXPAND_ROOTFS_GROWN 相同
+EXPAND_MARK=/tmp/mwrt-expand-rootfs.grown
+GATE_MAX=900
+# s64: USB2→3 切换进度用。与 mwrt-qmodem-usb3 的 BOOT_SETTLE / MAX_TRIES 对齐,
+# 那边改了这里要跟。TRIES 已在上面定义; .wait=还在等开机判型未复位, .done=已放弃。
+USB3_BOOT_SETTLE=120
+USB3_MAX_TRIES=2
+# s81: 复位后模组没回来时的断电救援(mwrt-qmodem-usb3 的 RESCUE / LOST / RESCUE_MAX),
+# .rescue=已补几次断电重启, .lost=补满了还没回来(脚本已放弃, 只能重启路由器)
+USB3_RESCUE_MAX=2
+# 开机后 mt5700m.sh 还没起来(simcardstat 尚不存在)的这段也算初始化中
+SIM_BOOT_WINDOW=300
+
+# s63 无线网桥事件: controller 的 wlbridge_join / wlbridge_leave 写一行
+#   "<epoch>|<up|down>|<ssid>"  到这个文件。本脚本把它当"一次性事件通知"显示,
+#   超过 WLB_EVENT_TTL 秒就不再显示(事件通知只提示一小会儿, 不常驻)。
+# 两边路径必须一致(controller/modem.lua 里是同一个)。
+WLB_EVENT=/tmp/mwrt-wlbridge.event
+WLB_EVENT_TTL=180
+
+# 接口接入事件(网线插上 / USB 设备插上) → 一次性通知。
+#   网口: 物理口(OF_NAME=mac 且有 phydev, 与 router3d-data 同一判据)的
+#         carrier_up_count 比上次快照大、且现在有链路 = 刚插上网线。
+#   USB:  /usr/libexec/mwrt-usbinfo(首页设备图共用)列出的设备, 按 vid:pid:序列号
+#         认人, 不按总线位置 —— 模组 USB2→3 重训会从 1-1 换到 2-1, 不能算新插。
+#         蜂窝模组只在 N5000(模组走 USB 转接板)上报, 而且每次开机同一台只报一次:
+#         其他机型的模组焊在板载槽位上, 重训/复位掉总线再回来都不是"接入"。
+# 快照只在有人开着页面(本接口每 10 秒被问一次)时才新鲜; 超过 PORT_STALE 秒没人问,
+# 中间发生的变化分不清是刚才还是几小时前, 只更新快照不报。第一次(没有快照)也只建快照。
+PORT_STATE=/tmp/mwrt-portstate
+PORT_EVENT=/tmp/mwrt-port.event
+PORT_SEEN=/tmp/mwrt-port.seen
+PORT_LOCK=/tmp/mwrt-port.lock
+PORT_EVENT_TTL=150
+PORT_STALE=120
+# s88: USB 网卡检测的状态文件(后端写, 这里只读): {"enabled":true,"devs":[{"dev","kind","drv",...}]}
+USBNIC_JSON=/tmp/mwrt-usbnic.json
+
+TXT_USB3='检测到首次刷机，模组初始化在USB2.0，正在切换为3.0通道，网络可能会断开1分钟。'
+TXT_SIMINIT='SIM卡正在初始化，目前未拨号。'
+TXT_USB3_LOST='模组在切换USB3.0通道时没有回到系统，已自动断电重启仍未恢复。请重启路由器，重启后即可正常使用。'
+TXT_GATE='检测到首次刷机，模组正在从USB2.0切换为3.0通道。请稍等约两分钟再重启，否则可能影响模组使用。'
+
+uptime_s() {
+	local u
+	u="$(cut -d. -f1 /proc/uptime 2>/dev/null)"
+	case "$u" in ''|*[!0-9]*) u=0 ;; esac
+	echo "$u"
+}
+
+# 与 mwrt-qmodem-usb3 的 find_modem 相同
+find_modem() {
+	local d
+	for d in "$USBDEV"/[0-9]-[0-9]*; do
+		[ -d "$d" ] || continue
+		case "$(basename "$d")" in *:*) continue ;; esac
+		[ "$(cat "$d/idVendor" 2>/dev/null):$(cat "$d/idProduct" 2>/dev/null)" = "$MT5700_ID" ] || continue
+		basename "$d"
+		return 0
+	done
+	return 1
+}
+
+# 与 mwrt-qmodem-usb3 的 image_id 相同, 两边必须一起改
+image_id() {
+	local b d
+	b="$(sed -n 's/^BUILD_ID="\(.*\)"$/\1/p' /usr/lib/os-release 2>/dev/null)"
+	d="$(sed -n 's/^OPENWRT_BUILD_DATE="\(.*\)"$/\1/p' /usr/lib/os-release 2>/dev/null)"
+	[ -n "$b$d" ] || b="$(cat /etc/openwrt_version 2>/dev/null)"
+	echo "${b:-unknown}-$d"
+}
+
+# s199 转网口机型(5700 的数据走机身 2.5G PHY, USB 只给 AT 串口): 不存在"模组落在 USB2.0 降速"这回事,
+# 重训/断电救援/切换通知一律不参与。C5800 与 C8-668/688/5800 同属此类。
+zwk_board() {
+	case "$(cat /tmp/sysinfo/board_name /tmp/sysinfo/model 2>/dev/null | tr 'A-Z' 'a-z')" in
+		*c5800*|*c8-668*|*c8-688*|*c8-5800*) return 0 ;;
+	esac
+	return 1
+}
+
+usb3_pending() {
+	local slot speed
+	zwk_board && return 1
+	[ "$(uptime_s)" -lt "$GATE_MAX" ] || return 1
+	[ "$(cat "$ONCE" 2>/dev/null)" = "$(image_id)" ] && return 1
+	if slot="$(find_modem)"; then
+		speed="$(cat "$USBDEV/$slot/speed" 2>/dev/null)"
+		case "$speed" in 480|12|1.5) return 0 ;; esac
+		return 1
+	fi
+	# 不在总线上: 只有已经发过复位(计数文件在)才是"切换途中"; 救援放弃了(.lost)就不是
+	[ -s "$TRIES" ] && [ ! -f "$TRIES.lost" ]
+}
+
+# s81: 切换脚本断电救援也没把模组拉回来。不拦重启(重启就是解法), 只提示去重启
+usb3_lost() {
+	zwk_board && return 1
+	[ -f "$TRIES.lost" ] || return 1
+	! find_modem >/dev/null 2>&1
+}
+
+sim_initializing() {
+	local slot pid st mt busy=0
+	slot="$(find_modem)" || return 1
+
+	pid="$(cat "$SIMLOCK" 2>/dev/null)"
+	case "$pid" in ''|*[!0-9]*) ;; *) [ -d "/proc/$pid" ] && busy=1 ;; esac
+
+	if [ -f "$SIMSTAT" ]; then
+		# 只认最近 SIM_BOOT_WINDOW 秒内写的: mt5700m.sh 被杀在半路时文件会一直停在
+		# "SIM INIT...", 不能让一条关不掉的消息永远挂着
+		mt="$(date -r "$SIMSTAT" +%s 2>/dev/null)"
+		case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
+		if [ $(( $(date +%s) - mt )) -lt "$SIM_BOOT_WINDOW" ]; then
+			st="$(cat "$SIMSTAT" 2>/dev/null)"
+			case "$st" in 'SIM INIT...'|*正在初始化*) busy=1 ;; esac
+		fi
+	else
+		[ "$(uptime_s)" -lt "$SIM_BOOT_WINDOW" ] && busy=1
+	fi
+	[ "$busy" = 1 ] || return 1
+
+	# 已经拨上就不是"未拨号"了。qmodem 的网口段名就是槽位名(2-1 -> 2_1)
+	[ "$(ifstatus "$(echo "$slot" | sed 's/[.:-]/_/g')" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = "true" ] && return 1
+	return 0
+}
+
+# 在生成就输出进度(0-100), 还在等那 60 秒输出空串; 没在生成返回 1
+swap_progress() {
+	local pid sz
+	pid="$(cat "$SWAPBUSY" 2>/dev/null)"
+	case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+	# 后台进程没了(被杀在半路)就不算, 关不掉的消息不能永远挂着
+	grep -q mwrt-swapfile "/proc/$pid/cmdline" 2>/dev/null || return 1
+	if [ -f "$SWAPFILE.tmp" ]; then
+		sz="$(stat -c %s "$SWAPFILE.tmp" 2>/dev/null)"
+		case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+		echo $(( 5 + sz / 1048576 * 85 / SWAP_MB ))
+	elif [ -f "$SWAPFILE" ]; then
+		echo 95
+	else
+		echo
+	fi
+}
+
+swap_text() {
+	local sz=""
+	[ -s "$EXPAND_MARK" ] && sz="$(df -h /overlay 2>/dev/null | awk 'NR==2{print $2}')"
+	[ -n "$sz" ] && printf 'SD卡已自动扩容到%s，' "$sz"
+	printf '正在创建%sMB虚拟内存（仅首次开机），约需2分钟，期间系统可能稍慢，请勿断电。' "$SWAP_MB"
+}
+
+# 设备时钟是否可信: 当前 epoch 落在 [构建时间-1天, 构建时间+20年]。
+# OPENWRT_BUILD_DATE 兼容纯数字 epoch 和 "YYYY-MM-DD HH:MM:SS" 两种写法(BusyBox 不用 date -d,
+# 日期用 awk 折算), 解析失败回落 1767225600。一次调用内只算一次。
+CLOCK_OK_V=""
+clock_ok() {
+	if [ -z "$CLOCK_OK_V" ]; then
+		local bd be now
+		bd="$(sed -n 's/^OPENWRT_BUILD_DATE="\(.*\)"$/\1/p' /usr/lib/os-release 2>/dev/null)"
+		case "$bd" in
+			''|*[!0-9]*)
+				be="$(echo "$bd" | awk '{
+					split($1, a, "-"); split($2, t, ":")
+					if (a[1] < 2000 || a[2] < 1 || a[2] > 12) exit
+					y = a[1]; m = a[2]; d = a[3]
+					if (m <= 2) y--
+					era = int(y / 400); yoe = y - era * 400
+					mp = (m + 9) % 12
+					doy = int((153 * mp + 2) / 5) + d - 1
+					doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+					days = era * 146097 + doe - 719468
+					printf "%d", days * 86400 + t[1] * 3600 + t[2] * 60 + t[3]
+				}' 2>/dev/null)" ;;
+			*) be="$bd" ;;
+		esac
+		case "$be" in ''|*[!0-9]*) be=1767225600 ;; esac
+		[ "$be" -ge 1000000000 ] || be=1767225600
+		now="$(date +%s)"
+		if [ "$now" -ge $((be - 86400)) ] && [ "$now" -le $((be + 630720000)) ]; then
+			CLOCK_OK_V=1
+		else
+			CLOCK_OK_V=0
+		fi
+	fi
+	[ "$CLOCK_OK_V" = 1 ]
+}
+
+add_notice() {
+	json_add_object
+	json_add_string id "$1"
+	json_add_string level "$2"
+	json_add_boolean closable "$3"
+	json_add_string text "$4"
+	[ -n "$5" ] && json_add_string link "$5"
+	[ -n "$6" ] && json_add_int progress "$6"
+	# 可选: 专属图标(前端 ICON 表里的键)和标题(替换"系统通知")
+	[ -n "$7" ] && json_add_string icon "$7"
+	[ -n "$8" ] && json_add_string title "$8"
+	# 可选(s88): 点通知能做的事(usbask = 直达 USB 网卡提示框)和对应的网口名, 前端据此显示「去选择」
+	[ -n "${10}" ] && json_add_string act "${10}"
+	[ -n "${11}" ] && json_add_string dev "${11}"
+	# 可选: 事件发生的 epoch 秒; 带 ts 的通知同时给出设备时钟是否可信
+	if [ -n "$9" ]; then
+		json_add_int ts "$9"
+		if clock_ok; then json_add_boolean clock_ok 1; else json_add_boolean clock_ok 0; fi
+	fi
+	json_close_object
+}
+
+# 无线网桥一次性事件 → 通知。读事件文件(epoch|up|ssid 或 epoch|down|ssid),
+# 事件在 WLB_EVENT_TTL 秒内才显示, 过期自动不再出。id 带上 epoch, 这样"连上"
+# 和"断开"是两条不同 id, 前端不会把它们当同一条去重。closable=1 用户可手动关掉。
+wlb_event_notice() {
+	[ -s "$WLB_EVENT" ] || return
+	local line ts kind ssid now age
+	read -r line < "$WLB_EVENT" 2>/dev/null
+	ts="${line%%|*}"
+	kind="${line#*|}"; ssid="${kind#*|}"; kind="${kind%%|*}"
+	[ -n "$ts" ] || return
+	case "$ts" in *[!0-9]*) return ;; esac
+	now="$(date +%s)"
+	age=$((now - ts))
+	[ "$age" -ge 0 ] && [ "$age" -le "$WLB_EVENT_TTL" ] || return
+	if [ "$kind" = "up" ]; then
+		add_notice "wlbridge-up-$ts" info 1 "已通过无线网桥接入「${ssid:-上游 WiFi}」，网络出口已切换。" "" "" "" "" "$ts"
+	elif [ "$kind" = "down" ]; then
+		add_notice "wlbridge-down-$ts" info 1 "已断开无线网桥「${ssid:-上游 WiFi}」，网络出口已切回原线路。" "" "" "" "" "$ts"
+	fi
+}
+
+# s88: USB 网卡检测开着吗(后端状态文件里 enabled=true)。开着时, 类型为 nic / tether / net 的 USB 设备
+# (网卡或手机共享)由后端的 nicin/thrin 等事件负责提示, 通用的 usb / usboff 不再重复报。
+usbnic_managed() {
+	[ -s "$USBNIC_JSON" ] && [ "$(jsonfilter -i "$USBNIC_JSON" -e '@.enabled' 2>/dev/null)" = true ]
+}
+
+# 当前快照: "eth <名> <插线次数> <链路>" 和 "usb <vid:pid:序列号> <类型>|<容量MB>|<厂商>|<名称>|<速率>"
+port_snapshot() {
+	local d n
+	for d in /sys/class/net/eth*; do
+		[ -e "$d/phydev" ] || continue
+		grep -q 'OF_NAME=mac' "$d/uevent" 2>/dev/null || continue
+		n="${d##*/}"
+		echo "eth $n $(cat "$d/carrier_up_count" 2>/dev/null || echo 0) $(cat "$d/carrier" 2>/dev/null || echo 0)"
+	done
+	[ -x /usr/libexec/mwrt-usbinfo ] || return 0
+	/usr/libexec/mwrt-usbinfo 2>/dev/null | while IFS='|' read -r b v p sp t mb sub ser mfr name; do
+		[ -n "$v" ] || continue
+		# 认人键里不能有空格(下面按空格切字段)
+		echo "usb $(printf '%s' "$v:$p:$ser" | tr ' ' '_') $t|$mb|$mfr|$name|$sp"
+	done
+}
+
+# 同一个口(网口名 / USB 认人键)只留最新一条事件: 插上后马上拔掉, "已接入"那条就被"已断开"顶掉, 反之亦然
+port_event_add() {
+	if [ -s "$PORT_EVENT" ]; then
+		awk -F'|' -v k="$2" '$3 != k' "$PORT_EVENT" > "$PORT_EVENT.n" 2>/dev/null
+		mv -f "$PORT_EVENT.n" "$PORT_EVENT"
+	fi
+	echo "$1" >> "$PORT_EVENT"
+}
+
+port_scan() {
+	local now cur old age mt wan model k a b c rest t
+	now="$(date +%s)"
+	cur="$(port_snapshot)"
+	if [ ! -f "$PORT_STATE" ]; then
+		echo "$cur" > "$PORT_STATE"
+		return
+	fi
+	mt="$(date -r "$PORT_STATE" +%s 2>/dev/null)"
+	case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
+	age=$((now - mt))
+	old="$(cat "$PORT_STATE" 2>/dev/null)"
+	echo "$cur" > "$PORT_STATE"
+	[ "$age" -ge 0 ] && [ "$age" -le "$PORT_STALE" ] || return
+
+	wan="$(uci -q get network.wan.device)"; [ -n "$wan" ] || wan=eth0
+	model="$(tr 'A-Z' 'a-z' < /tmp/sysinfo/model 2>/dev/null)"
+	echo "$cur" | while read -r k a b c; do
+		case "$k" in
+		eth)
+			local o
+			local o oc role=LAN spd
+			o="$(echo "$old" | sed -n "s/^eth $a \([0-9]*\) .*/\1/p")"
+			oc="$(echo "$old" | sed -n "s/^eth $a [0-9]* \([0-9]*\)$/\1/p")"
+			case "$o" in ''|*[!0-9]*) continue ;; esac
+			case "$b" in ''|*[!0-9]*) continue ;; esac
+			[ "$a" = "$wan" ] && role=WAN
+			if [ "$b" -gt "$o" ] && [ "$c" = 1 ]; then
+				spd="$(cat "/sys/class/net/$a/speed" 2>/dev/null)"
+				port_event_add "$now|eth|$a|$role|$spd" "$a"
+			elif [ "$oc" = 1 ] && [ "$c" = 0 ]; then
+				# 上一轮还有链路、这一轮没了 = 网线拔掉(或对端断电)
+				port_event_add "$now|ethoff|$a|$role" "$a"
+			fi
+			;;
+		usb)
+			# 名称里可能有空格, 被 read 切进了 c, 拼回去
+			b="$b${c:+ $c}"
+			echo "$old" | grep -qxF "usb $a $b" && continue
+			echo "$old" | grep -qF "usb $a " && continue
+			t="${b%%|*}"
+			case "$t" in nic|tether|net) usbnic_managed && continue ;; esac
+			if [ "$t" = modem ]; then
+				case "$model" in *n5000*) ;; *) continue ;; esac
+				grep -qxF "$a" "$PORT_SEEN" 2>/dev/null && continue
+				echo "$a" >> "$PORT_SEEN"
+			fi
+			port_event_add "$now|usb|$a|$b" "$a"
+			;;
+		esac
+	done
+	# 上一轮有、这一轮没有的 USB 设备 = 拔掉了。蜂窝模组不报: USB2→3 切换、模组重启都会掉线重枚举, 报出来全是误报
+	echo "$old" | while read -r k a b c; do
+		[ "$k" = usb ] || continue
+		echo "$cur" | grep -qF "usb $a " && continue
+		b="$b${c:+ $c}"
+		[ "${b%%|*}" = modem ] && continue
+		# s88: USB 网卡 / 手机共享的拔出由后端的 nicoff / throff 报(带"是否已恢复网关存活")
+		case "${b%%|*}" in nic|tether|net) usbnic_managed && continue ;; esac
+		port_event_add "$now|usboff|$a|$b" "$a"
+	done
+
+	# 过期事件删掉, 文件不会越攒越大
+	if [ -s "$PORT_EVENT" ]; then
+		awk -F'|' -v n="$now" -v t="$PORT_EVENT_TTL" '$1 ~ /^[0-9]+$/ && n - $1 <= t' "$PORT_EVENT" > "$PORT_EVENT.n" 2>/dev/null
+		mv -f "$PORT_EVENT.n" "$PORT_EVENT"
+	fi
+}
+
+port_speed_txt() {
+	case "$1" in
+		10000) echo 10Gbps ;; 5000) echo 5Gbps ;; 2500) echo 2.5Gbps ;; 1000) echo 1Gbps ;;
+		''|-*|*[!0-9]*) echo "" ;;
+		*) echo "${1}Mbps" ;;
+	esac
+}
+
+# 去掉名字末尾残留的分隔符(「 · 」「，」「（」等)。按整串后缀剥, 不用 sed 的字符类: 中文是多字节, 字符类会按字节切坏字
+trim_sep() {
+	local v="$1" p sep
+	while :; do
+		p="$v"
+		for sep in ' ' '·' '，' ',' '、' '：' ':' '（' '(' '-' '—' '|'; do
+			v="${v%"$sep"}"
+		done
+		[ "$v" = "$p" ] && break
+	done
+	printf '%s' "$v"
+}
+
+# s88: USB 网卡 / 手机数据线共享的事件 → 通知。事件行: 时间戳|类型|接口名|标签(产品名等)
+#   nicin   USB 网卡接入、等待用户选 WAN/LAN → 琥珀色, 带「去选择」(前端按 usbnic_state 判断还能不能点)
+#   niclan  已按 LAN 接入        nicwan  已设为 WAN, 网关存活已切到它
+#   nicoff  USB 网卡拔出; 标签里带「已恢复网关存活」就说明设为 WAN 的那块被拔了、设置已还原
+#   thrin   手机共享接入, 已自动作为出口   throff  手机共享断开, 已恢复网关存活
+nic_event_notice() {
+	local ts="$1" kind="$2" a="$3" b="$4" id nm="" rec=0 q txt drv="" kt asafe
+	id="port-$ts-$(printf '%s' "$a" | tr -c 'A-Za-z0-9' '_')-$kind"
+	nm="$b"
+	case "$b" in
+		*已恢复网关存活*) rec=1; nm="$(trim_sep "${b%%已恢复网关存活*}")" ;;
+	esac
+	# 「名称 · 接口名」。标签空就只写接口名
+	q="${a}"; [ -n "$nm" ] && q="${nm} · ${a}"
+	case "$kind" in
+		nicin)
+			add_notice "$id" info 1 "检测到 USB 网卡（${q}）接入，请选择是否当作 WAN 口使用。不选择将自动按 LAN 口处理。" "" "" usb-ask "USB 网卡待选择" "$ts" usbask "$a" ;;
+		niclan)
+			add_notice "$id" info 1 "USB 网卡（${q}）已按 LAN 口接入，可连接电脑、交换机等设备。" "" "" usb "USB 网卡接入 · LAN" "$ts" ;;
+		nicwan)
+			add_notice "$id" info 1 "USB 网卡（${q}）已设为 WAN 口，网关存活已切换到该网卡。拔出后会自动恢复原来的设置。" "" "" usb "USB 网卡接入 · WAN" "$ts" ;;
+		nicoff)
+			txt="USB 网卡（${q}）已拔出"
+			[ "$rec" = 1 ] && txt="${txt} · 已恢复原网关存活设置"
+			add_notice "$id" info 1 "${txt}。" "" "" usb-off "USB 网卡拔出" "$ts" ;;
+		thrin)
+			# 驱动 ipheth 是 iPhone 个人热点, 其余(rndis_host 等)按 RNDIS 说
+			kt=RNDIS
+			asafe="$(printf '%s' "$a" | tr -cd 'A-Za-z0-9_.-')"
+			[ -s "$USBNIC_JSON" ] && [ -n "$asafe" ] && drv="$(jsonfilter -i "$USBNIC_JSON" -e "@.devs[@.dev='$asafe'].drv" 2>/dev/null)"
+			[ "$drv" = ipheth ] && kt='iPhone 个人热点'
+			add_notice "$id" info 1 "检测到手机数据线网络接入（${kt}）· 已自动作为上网出口，网关存活已切换到该网卡（${q}）。" "" "" phone "手机共享接入" "$ts" ;;
+		throff)
+			txt="手机共享（${q}）已断开"
+			[ "$rec" = 1 ] && txt="${txt} · 已恢复原网关存活设置"
+			add_notice "$id" info 1 "${txt}。" "" "" phone-off "手机共享断开" "$ts" ;;
+	esac
+}
+
+port_event_notice() {
+	# 多个页面同时问时只让一个去比快照, 其余直接读事件
+	if command -v flock >/dev/null 2>&1; then
+		( flock -n 9 && port_scan ) 9>"$PORT_LOCK"
+	else
+		port_scan
+	fi
+	[ -s "$PORT_EVENT" ] || return
+	local now ts kind a b c d e f g sp txt lb nm sz ul
+	now="$(date +%s)"
+	while IFS='|' read -r ts kind a b c d e f g; do
+		case "$ts" in ''|*[!0-9]*) continue ;; esac
+		[ $((now - ts)) -le "$PORT_EVENT_TTL" ] || continue
+		if [ "$kind" = eth ]; then
+			# a=网口 b=LAN/WAN c=速率
+			sp="$(port_speed_txt "$c")"
+			txt="${b} 口（${a}）已接入网线"
+			[ -n "$sp" ] && txt="${txt}，协商速率 ${sp}"
+			add_notice "port-$ts-$a" info 1 "${txt}。" "" "" eth "${b} 口接入" "$ts"
+		elif case "$kind" in nicin|niclan|nicwan|nicoff|thrin|throff) true ;; *) false ;; esac; then
+			nic_event_notice "$ts" "$kind" "$a" "$b"
+		elif [ "$kind" = ethoff ]; then
+			add_notice "port-$ts-$a-off" info 1 "${b} 口（${a}）网线已断开。" "" "" eth-off "${b} 口断开" "$ts"
+		elif [ "$kind" = usb ] || [ "$kind" = usboff ]; then
+			# a=vid:pid:序列号 b=类型 c=容量MB d=厂商 e=名称 f=速率
+			case "$b" in
+				modem) lb='蜂窝模组' ;; net|nic) lb='USB 网卡' ;; tether) lb='手机共享网络' ;; storage) lb='存储设备' ;;
+				hid) lb='键盘/鼠标' ;; hub) lb='USB 集线器' ;; audio) lb='USB 声卡' ;;
+				video|camera) lb='USB 摄像头' ;; capture) lb='HDMI 采集卡' ;; display) lb='USB 显示适配器' ;; printer) lb='打印机' ;; bt) lb='蓝牙适配器' ;;
+				*) lb='USB 设备' ;;
+			esac
+			nm="${e:-$d}"; [ -n "$nm" ] || nm="${a%:*}"
+			if [ "$kind" = usboff ]; then
+				txt="USB 口的${lb}「${nm}」已移除"
+				case "$b" in video|camera|capture|display) txt="${lb}已移除「${nm}」" ;; esac
+				# s89: USB 声卡拔出走扬声器加斜杠的专属图标
+				if [ "$b" = audio ]; then
+					add_notice "port-$ts-$(printf '%s' "$a" | tr -c 'A-Za-z0-9' '_')-off" info 1 "USB 声卡已拔出「${nm}」。" "" "" audio-off "USB 声卡拔出" "$ts"
+					continue
+				fi
+				add_notice "port-$ts-$(printf '%s' "$a" | tr -c 'A-Za-z0-9' '_')-off" info 1 "${txt}。" "" "" usb-off "USB 移除" "$ts"
+				continue
+			fi
+			txt="USB 口已接入${lb}「${nm}」"
+			case "$b" in video|camera|capture|display) txt="${lb}已接入「${nm}」" ;; esac
+			case "$c" in ''|0|*[!0-9]*) ;; *)
+				if [ "$c" -ge 1024 ]; then
+					sz="$(awk -v m="$c" 'BEGIN{printf "%.1fGB", m/1024}')"
+				else
+					sz="${c}MB"
+				fi
+				txt="${txt}，容量 ${sz}" ;;
+			esac
+			case "$f" in
+				20000|10000) ul='USB 3.2' ;; 5000) ul='USB 3.0' ;; 480) ul='USB 2.0' ;; 12|1) ul='USB 1.1' ;; *) ul='' ;;
+			esac
+			[ -n "$ul" ] && txt="${txt}（${ul}）"
+			# s89: USB 声卡接入走扬声器专属图标, 文案「USB 声卡已接入「名称」（USB x.x）」(声卡没有容量)
+			if [ "$b" = audio ]; then
+				add_notice "port-$ts-$(printf '%s' "$a" | tr -c 'A-Za-z0-9' '_')" info 1 "USB 声卡已接入「${nm}」${ul:+（${ul}）}。" "" "" audio "USB 声卡接入" "$ts"
+				continue
+			fi
+			add_notice "port-$ts-$(printf '%s' "$a" | tr -c 'A-Za-z0-9' '_')" info 1 "${txt}。" "" "" usb "USB 接入" "$ts"
+		fi
+	done < "$PORT_EVENT"
+}
+
+# s64: USB2→3 切换进度(0-100)。从切换脚本留下的标记文件和模组当前速率折算, 阶段:
+#   等开机判型($TRIES.wait 在、还没复位): uptime 0→BOOT_SETTLE 映射 0→22%;
+#   复位重训($TRIES=n): 每次一段, n=1→~55%、n=2→~88%(复位中模组掉总线再给一点);
+#   已放弃($TRIES.done): 95%(马上收尾, 保留 HS 链路)。
+# 封顶 95 —— 真到 SuperSpeed 后 usb3_pending 直接不成立, 整条通知消失, 不走到 100。
+usb3_progress() {
+	local n up
+	[ -f "$TRIES.done" ] && { echo 95; return; }
+	n=0; [ -f "$TRIES" ] && n="$(cat "$TRIES" 2>/dev/null)"
+	case "$n" in *[!0-9]*) n=0 ;; esac
+	if [ "$n" -ge 1 ]; then
+		# 25% 起步, 每次重训占 (90-25)/MAX_TRIES; 复位时模组不在总线上, 多给 8% 表示正在动
+		local base step pr
+		step=$(( (90 - 25) / USB3_MAX_TRIES ))
+		base=$(( 25 + (n - 1) * step ))
+		pr=$(( base + step / 2 ))
+		if ! find_modem >/dev/null 2>&1; then
+			pr=$(( base + step - 2 ))
+			# 正在断电救援: 每次再往前挪一点, 不让进度停死在一个数上
+			local r=0
+			[ -f "$TRIES.rescue" ] && r="$(cat "$TRIES.rescue" 2>/dev/null)"
+			case "$r" in ''|*[!0-9]*) r=0 ;; esac
+			pr=$(( pr + r * 5 ))
+		fi
+		[ "$pr" -gt 94 ] && pr=94
+		echo "$pr"; return
+	fi
+	# 还没复位: 按 uptime 在开机判型窗口里爬 0→22
+	up="$(uptime_s)"
+	local pr=$(( up * 22 / USB3_BOOT_SETTLE ))
+	[ "$pr" -lt 3 ] && pr=3
+	[ "$pr" -gt 22 ] && pr=22
+	echo "$pr"
+}
+
+# 进度阶段对应的中文说明(文案跟着阶段走, 比死字符串更有信息)
+usb3_text() {
+	[ -f "$TRIES.done" ] && { printf '仅首次开机：模组通道切换收尾中，若仍为2.0将保持当前链路，请勿断电。'; return; }
+	local n=0; [ -f "$TRIES" ] && n="$(cat "$TRIES" 2>/dev/null)"
+	case "$n" in *[!0-9]*) n=0 ;; esac
+	if [ "$n" -ge 1 ] && [ -f "$TRIES.rescue" ] && ! find_modem >/dev/null 2>&1; then
+		printf '仅首次开机：模组复位后没有回到系统，正在断电重启模组（第%s/%s次），约需半分钟，请勿断电。' "$(cat "$TRIES.rescue" 2>/dev/null)" "$USB3_RESCUE_MAX"
+	elif [ "$n" -ge 1 ]; then
+		printf '仅首次开机：正在复位模组切换USB3.0通道（第%s/%s次），网络会短暂断开，请勿断电。' "$n" "$USB3_MAX_TRIES"
+	else
+		printf '仅首次开机：模组初始化在USB2.0，正在等待开机检测完成后切换3.0通道，请勿断电。'
+	fi
+}
+
+# s102: 5700 短信 / 未接来电 → 通知卡片。ucode 源码与 _s102/out/notice/phone_notice.uc 相同(改一处要同步改另一处)。
+# events 文件不存在或为空(没有 5700 / 守护没起)就一个进程都不起, 零开销; 有内容时多一次 ucode(不 fork 别的)。
+# ucode 失败或输出为空就原样输出前面拼好的 JSON, 不影响别的通知。
+phone_uc() {
+	MWRT_BASE="$1" ucode - 2>/dev/null <<'UCEOF'
+// 【此文件是 luci.mwrt-notice 里 phone_merge() 的 ucode 源, 单独存一份便于阅读和本地检查;
+//  部署时已原样内嵌进 luci.mwrt-notice(heredoc), 板上并不单独存在这个文件。】
+//
+// s102: 5700 新短信 / 未接来电 → 右上角全局通知卡片。
+// 输入: 环境变量 MWRT_BASE = 前面 jshn 已拼好的 {"notices":[...]} JSON 文本。
+// 输出: 同一结构, 末尾追加短信 / 未接来电卡片(最新在前, 最多 5 张, 超出另加一张汇总卡)。
+// 任何异常 → 原样输出 MWRT_BASE, 绝不让这一段拖垮别的通知。
+// 事件内容只在 ucode 里用 JSON 解析读取, 从不经过 shell, 也就不存在命令注入。
+//
+// 可用环境变量改路径 / 时间, 仅供测试(生产环境不设, 走默认):
+//   PHONE_EVENTS PHONE_STATE PHONE_MODCONF PHONE_USBDEV PHONE_UCI_DIR PHONE_OSREL PHONE_NOW
+//
+// s103: 另外在 5700 在场、phoneen != 0、state.json 的 ims 严格等于 0 时输出一张固定 id 'ims-off' 的提醒卡
+// (短信功能 IMS 未开启 → 无法通话也收不到短信), link='smsset' 指向短信管理设置页。state.json 缺失 / 损坏 /
+// 过期(守护停了, ts 超过 180 秒没更新)都当没有, 不报错。ims 为 1 / -1 不出卡。
+//
+// s105: 已读状态改为设备端统一记录。/tmp/mwrt-phone/notice.ack 每行一个卡片 id(sms-<事件id>-<ts> / miss-<事件id>-<ts>),
+// 由 luci.controller.modem 的 notice_ack 接口(经 /usr/libexec/mwrt-notice-ack.uc)追加。本脚本只读它的最后 400 行:
+// 已读的短信 / 未接来电不再出卡, 汇总卡 sms-more 只统计「未读且超出 5 张」的部分(文案「另有 N 条未读短信」)。
+// 文件缺失 / 损坏(非法行忽略)/ 过大(只读尾部 32KB)/ 符号链接 / 非 root 属主都当没有已读记录, 不报错。
+// PHONE_ACK 环境变量改路径, 仅供测试。
+
+import { open, stat, lstat, readfile, lsdir } from 'fs';
+import { cursor } from 'uci';
+
+const RAW = getenv('MWRT_BASE');
+
+function env(k, d) {
+	let v = getenv(k);
+	return (v != null && v != '') ? v : d;
+}
+
+const EVENTS = env('PHONE_EVENTS', '/tmp/mwrt-phone/events');
+const STATE = env('PHONE_STATE', '/tmp/mwrt-phone/state.json');
+const MODCONF = env('PHONE_MODCONF', '/tmp/modconf.conf');
+const USBDEV = env('PHONE_USBDEV', '/sys/bus/usb/devices');
+const UCIDIR = env('PHONE_UCI_DIR', '');
+const ACKFILE = env('PHONE_ACK', '/tmp/mwrt-phone/notice.ack');
+const OSREL = env('PHONE_OSREL', '/usr/lib/os-release');
+const WINDOW = 86400;       // 只看最近 24 小时的事件
+const MAXCARD = 5;          // 最多直接出的卡片数
+const TAILMAX = 262144;     // events 很大时只读尾部这么多字节
+const TEXTMAX = 80;         // 短信摘要最多 80 个字
+const SENDMAX = 40;         // 发件人最多 40 个字
+const NUMMAX = 24;          // 号码最多 24 个字
+const MISS_ZH = '未接来电';
+const ACK_LINES = 400;      // s105: 已读记录只认最后这么多行
+const ACK_BYTES = 32768;    // s105: 已读记录只读尾部这么多字节
+const STATE_STALE = 180;    // state.json 的 ts 超过这么多秒没更新就不信(守护没在跑)
+
+let now = int(env('PHONE_NOW', '0'));
+if (!(now > 0)) now = time();
+
+// 5700 在场判据(与 footer.ut 一致): modconf 含 5700, 并且 USB 总线上有 VID 3466 的设备
+function present() {
+	let mc = lc(readfile(MODCONF, 128) ?? '');
+	if (index(mc, '5700') < 0) return false;
+	for (let d in (lsdir(USBDEV) ?? [])) {
+		if (trim(readfile(`${USBDEV}/${d}/idVendor`, 16) ?? '') == '3466') return true;
+	}
+	return false;
+}
+
+// 设备时钟是否可信(与 luci.mwrt-notice 里 clock_ok() 同一判据): 当前时间落在 [构建时间-1天, 构建时间+20年]
+function clock_ok() {
+	let m = match(readfile(OSREL, 4096) ?? '', /OPENWRT_BUILD_DATE="([^"]*)"/);
+	let bd = m ? m[1] : '', be = 0, t;
+	if (match(bd, /^[0-9]+$/)) {
+		be = int(bd);
+	} else {
+		t = match(bd, /^([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{2})/);
+		if (t) be = timegm({ year: int(t[1]), mon: int(t[2]), mday: int(t[3]), hour: int(t[4]), min: int(t[5]), sec: int(t[6]) }) ?? 0;
+	}
+	if (!(be >= 1000000000)) be = 1767225600;
+	return now >= be - 86400 && now <= be + 630720000;
+}
+
+// 读 events 文件(每行一个 JSON), 文件很大时只读尾部并丢掉被截断的第一行
+function read_events() {
+	let st = stat(EVENTS), data;
+	if (!st || st.type != 'file' || !(st.size > 0)) return [];
+	if (st.size <= TAILMAX) {
+		data = readfile(EVENTS, TAILMAX) ?? '';
+	} else {
+		let f = open(EVENTS, 'r');
+		if (!f) return [];
+		f.seek(st.size - TAILMAX, 0);
+		data = f.read(TAILMAX) ?? '';
+		f.close();
+		let nl = index(data, '\n');
+		data = nl >= 0 ? substr(data, nl + 1) : '';
+	}
+	let out = [];
+	for (let line in split(data, '\n')) {
+		line = trim(line);
+		if (substr(line, 0, 1) != '{') continue;
+		let ev = null;
+		try { ev = json(line); } catch (e) { ev = null; }
+		if (type(ev) == 'object') push(out, ev);
+	}
+	return out;
+}
+
+// 按 UTF-8 字(码点)截断到 max 个, 同时:
+//   丢掉非法 UTF-8 字节(含过长编码 / 代理对, 免得后面 json-c 解析整条通知失败),
+//   控制字符(含换行 / 制表 / C1)一律折成单个空格, 首尾空白去掉。超长加「…」。
+function clip(s, max) {
+	if (type(s) != 'string') return '';
+	let out = [], n = 0, i = 0, len = length(s), sp = true, cut = false;
+	while (i < len) {
+		let c = ord(s, i), sz = 1, ws = false, lo = 0x80, hi = 0xBF;
+		if (c < 0x80) {
+			ws = (c <= 0x20 || c == 0x7f);
+		} else if (c >= 0xC2 && c <= 0xDF) {
+			sz = 2;
+		} else if (c >= 0xE0 && c <= 0xEF) {
+			sz = 3;
+			if (c == 0xE0) lo = 0xA0;
+			if (c == 0xED) hi = 0x9F;
+		} else if (c >= 0xF0 && c <= 0xF4) {
+			sz = 4;
+			if (c == 0xF0) lo = 0x90;
+			if (c == 0xF4) hi = 0x8F;
+		} else {
+			i++;
+			continue;
+		}
+		if (sz > 1) {
+			if (i + sz > len) break;
+			let ok = true;
+			for (let k = 1; k < sz; k++) {
+				let cc = ord(s, i + k);
+				if (cc < (k == 1 ? lo : 0x80) || cc > (k == 1 ? hi : 0xBF)) { ok = false; break; }
+			}
+			if (!ok) { i++; continue; }
+			// 评审 A 追加: 丢掉双向文字控制符 U+202A-202E / U+2066-2069(RTL 覆盖可把发件人 / 文字视觉上倒排, 用来伪装)
+			if (c == 0xE2 && ((ord(s, i + 1) == 0x80 && ord(s, i + 2) >= 0xAA && ord(s, i + 2) <= 0xAE) ||
+			                  (ord(s, i + 1) == 0x81 && ord(s, i + 2) >= 0xA6 && ord(s, i + 2) <= 0xA9))) {
+				i += sz;
+				continue;
+			}
+			if (c == 0xC2 && ord(s, i + 1) < 0xA0) ws = true;       // C1 控制字符
+			// U+2028 / U+2029 行分隔符也当空白
+			if (c == 0xE2 && ord(s, i + 1) == 0x80 && (ord(s, i + 2) == 0xA8 || ord(s, i + 2) == 0xA9)) ws = true;
+		}
+		if (ws) {
+			if (!sp) { push(out, ' '); sp = true; }
+		} else {
+			if (n >= max) { cut = true; break; }
+			push(out, substr(s, i, sz));
+			n++;
+			sp = false;
+		}
+		i += sz;
+	}
+	while (length(out) && out[length(out) - 1] == ' ') pop(out);
+	return join('', out) + (cut ? '…' : '');
+}
+
+// s103: 读 state.json 的 ims 字段。最多读 8KB, 解析失败 / 缺文件 / 过期一律返回 -1(未知)。
+function read_ims() {
+	let raw = readfile(STATE, 8192);
+	if (raw == null || index(raw, '"ims"') < 0) return -1;
+	let st = null;
+	try { st = json(raw); } catch (e) { st = null; }
+	if (type(st) != 'object') return -1;
+	let ts = st.ts;
+	if (type(ts) == 'int' && ts > 0 && now - ts > STATE_STALE) return -1;
+	return (type(st.ims) == 'int') ? st.ims : -1;
+}
+
+// s105: 读已读记录, 返回 {卡片id: true}。只认合法键(sms|miss-数字-数字), 其余行忽略。
+// 只接受 root 属主的普通文件(符号链接、目录、别人的文件都当没有)。
+function read_acks() {
+	let res = {};
+	let st = lstat(ACKFILE);
+	if (!st || st.type != 'file' || st.uid != 0 || !(st.size > 0)) return res;
+	let data;
+	if (st.size <= ACK_BYTES) {
+		data = readfile(ACKFILE, ACK_BYTES) ?? '';
+	} else {
+		let f = open(ACKFILE, 'r');
+		if (!f) return res;
+		f.seek(st.size - ACK_BYTES, 0);
+		data = f.read(ACK_BYTES) ?? '';
+		f.close();
+		let nl = index(data, '
+');
+		data = nl >= 0 ? substr(data, nl + 1) : '';
+	}
+	// 先挑出有效行再取最后 ACK_LINES 行(文件末尾的换行会多出一个空串, 不能让它占掉名额)
+	let valid = [];
+	for (let l in split(data, '
+')) {
+		l = trim(l);
+		if (length(l) <= 40 && match(l, /^(sms|miss)-[0-9]{1,10}-[0-9]{1,12}$/)) push(valid, l);
+	}
+	if (length(valid) > ACK_LINES) valid = slice(valid, length(valid) - ACK_LINES);
+	for (let l in valid) res[l] = true;
+	return res;
+}
+
+function main() {
+	let base = json(RAW);
+	if (type(base) != 'object') return RAW;
+	if (type(base.notices) != 'array') base.notices = [];
+
+	// 开关: phoneen 只有明确写 0 才关; phone_note_sms / phone_note_call 同理(缺省开)
+	let uc = UCIDIR != '' ? cursor(UCIDIR) : cursor();
+	let flag = (k) => uc.get_first('mwrt', 'ndis', k) != '0';
+	if (!flag('phoneen')) return RAW;
+	let want_sms = flag('phone_note_sms'), want_call = flag('phone_note_call');
+	if (!present()) return RAW;
+
+	// s103: IMS 关闭提醒(整张卡可点, 跳短信管理设置页); 排在短信 / 未接卡之前, 最先被看到
+	let extra = [];
+	if (read_ims() === 0) {
+		push(extra, {
+			id: 'ims-off', level: 'warn', closable: true, icon: 'sms', link: 'smsset',
+			title: '短信功能未开启',
+			text: '5700 的短信功能(IMS)是关闭的,目前无法拨打、接听电话,也收不到短信。点击前往开启。'
+		});
+	}
+
+	// 短信 / 未接两个开关都关时不读 events(ims-off 提醒不受这两个开关影响, 只受 phoneen 控制)
+	let evs = (want_sms || want_call) ? read_events() : [];
+	let sms = [], miss = [], seen = {}, i, ev, ts, id, key;
+	for (i = 0; i < length(evs); i++) {
+		ev = evs[i];
+		ts = int(ev.ts);
+		if (!(ts > 0) || now - ts > WINDOW || ts - now > WINDOW) continue;
+		id = int(ev.id);
+		if (!(id >= 0)) id = 0;
+		key = `${ev.type}-${id}-${ts}`;
+		if (seen[key]) continue;
+		if (ev.type == 'sms' && want_sms) {
+			seen[key] = true;
+			push(sms, { ev: ev, ts: ts, id: id, kind: 'sms' });
+		} else if (ev.type == 'call_end' && want_call && ev.reason == 'missed' && ev.dir != 'out' && !ev.answered) {
+			seen[key] = true;
+			push(miss, { ev: ev, ts: ts, id: id, kind: 'miss' });
+		}
+	}
+
+	// 分段未合并: 守护等了 60 秒没等到后续分段才会发 partial=1 的预览事件(文本带「(内容不完整)」)。
+	// 如果后面又来了同一发件人、内容以它开头的完整短信, 预览就是重复, 丢掉; 否则它是这条短信唯一的提醒, 保留。
+	let SUF = '(内容不完整)';
+	let keep = [];
+	for (i = 0; i < length(sms); i++) {
+		let it = sms[i], dup = false, j;
+		if (it.ev.partial) {
+			let tx = type(it.ev.text) == 'string' ? it.ev.text : '';
+			let p = index(tx, SUF);
+			let pfx = substr(p >= 0 ? substr(tx, 0, p) : tx, 0, 24);
+			if (length(pfx) >= 6) {
+				for (j = i + 1; j < length(sms); j++) {
+					let o = sms[j];
+					if (!o.ev.partial && o.ev.sender == it.ev.sender && type(o.ev.text) == 'string' && index(o.ev.text, pfx) == 0) { dup = true; break; }
+				}
+			}
+		}
+		if (!dup) push(keep, it);
+	}
+
+	// s105: 已读的不出卡(放在分段预览去重之后: 完整短信已读不会让被它顶掉的预览重新冒出来——预览本来就已被丢弃)
+	let acks = (length(keep) || length(miss)) ? read_acks() : {};
+	let unread = [];
+	for (i = 0; i < length(keep); i++) if (!acks[`sms-${keep[i].id}-${keep[i].ts}`]) push(unread, keep[i]);
+	let unread_miss = [];
+	for (i = 0; i < length(miss); i++) if (!acks[`miss-${miss[i].id}-${miss[i].ts}`]) push(unread_miss, miss[i]);
+
+	// 最新在前: 时间倒序, 同一秒内按事件 id 倒序
+	let all = sort([...unread, ...unread_miss], (a, b) => (b.ts - a.ts) || (b.id - a.id));
+	if (!length(all) && !length(extra)) return RAW;
+	for (i = 0; i < length(extra); i++) push(base.notices, extra[i]);
+
+	let ck = clock_ok();
+	let over_s = 0, over_m = 0;
+	for (i = 0; i < length(all); i++) {
+		let it = all[i];
+		if (i >= MAXCARD) {
+			if (it.kind == 'sms') over_s++; else over_m++;
+			continue;
+		}
+		let card = { id: `${it.kind}-${it.id}-${it.ts}`, level: 'info', closable: true };
+		if (it.kind == 'sms') {
+			let sender = clip(it.ev.sender, SENDMAX), tx = clip(it.ev.text, TEXTMAX);
+			card.text = tx != '' ? tx : '（无文字内容）';
+			card.link = 'sms';
+			card.icon = 'sms';
+			card.title = sender != '' ? sender : '新短信';
+		} else {
+			let num = clip(it.ev.number, NUMMAX);
+			card.text = MISS_ZH;
+			card.icon = 'miss';
+			card.title = num != '' ? num : '未知号码';
+		}
+		card.ts = it.ts;
+		card.clock_ok = ck;
+		push(base.notices, card);
+	}
+
+	// 汇总卡: id 固定, 条数变了文字原地更新; rev=超出条数, 前端把它并进本地兜底的「已读」键, 条数变了会重新出现。
+	// s105: 只统计未读的超出部分, 文案「另有 N 条未读短信」(覆盖 s103 的「较早短信」); 混入未接来电时标题「更多消息」。
+	// ack=汇总卡 × 对应的服务端范围: 只有短信溢出 → sms_older, 混入未接来电 → older(前端把当前显示的卡 id 作为 keep 一起发)。
+	if (over_s + over_m > 0) {
+		let parts = [];
+		if (over_s > 0) push(parts, `${over_s} 条未读短信`);
+		if (over_m > 0) push(parts, `${over_m} 个${MISS_ZH}`);
+		push(base.notices, {
+			id: 'sms-more', level: 'info', closable: true,
+			text: '另有 ' + join('、', parts),
+			link: 'sms', icon: 'sms',
+			title: over_m > 0 ? '更多消息' : '更多短信',
+			ack: over_m > 0 ? 'older' : 'sms_older',
+			rev: over_s + over_m
+		});
+	}
+	return sprintf('%.J', base);
+}
+
+let result = RAW;
+try { result = main() ?? RAW; } catch (e) { result = RAW; }
+print(result, '\n');
+UCEOF
+}
+
+phone_merge() {
+	local out
+	# s103: events 非空, 或 state.json 里 "ims":0(守护写的是紧凑 JSON)时才起 ucode; 其余情形零开销
+	local ev="${PHONE_EVENTS:-/tmp/mwrt-phone/events}" st="${PHONE_STATE:-/tmp/mwrt-phone/state.json}" need=0
+	if [ -s "$ev" ]; then
+		need=1
+	elif [ -s "$st" ] && grep -q '"ims": *0[,}]' "$st" 2>/dev/null; then
+		need=1
+	fi
+	if [ "$need" = 1 ] && command -v ucode >/dev/null 2>&1; then
+		out="$(phone_uc "$1")"
+		if [ -n "$out" ]; then
+			echo "$out"
+			return
+		fi
+	fi
+	echo "$1"
+}
+
+# ---- s155 chat begin ----
+# s155: 故障报修在线聊天 → 「维护人员发来新消息」通知卡。ucode 源码与 _s155/notice/src/chat_notice.uc 相同(改一处要同步改另一处)。
+# 聊天缓存(/tmp/mwrt-repair/chat.jsonl)不存在或为空(没有报修会话 / 重启后)就一个进程都不起, 零开销;
+# 有内容时多一次 ucode(不 fork 别的, 只读文件)。ucode 失败或输出为空就原样输出前面拼好的 JSON, 不影响别的通知。
+CHAT_SPOOL="${CHAT_SPOOL:-/tmp/mwrt-repair/chat.jsonl}"
+
+chat_uc() {
+	MWRT_BASE="$1" ucode - 2>/dev/null <<'UCEOF'
+// 【此文件是 luci.mwrt-notice 里 chat_merge() 的 ucode 源, 单独存一份便于阅读和本地检查;
+//  部署时已原样内嵌进 luci.mwrt-notice(heredoc), 板上并不单独存在这个文件。改一处要同步改另一处(build_notice.py 负责嵌入)。】
+//
+// s155: 故障报修在线聊天 → 右上角全局「维护人员发来新消息」通知卡。
+// 输入: 环境变量 MWRT_BASE = 前面已拼好的 {"notices":[...]} JSON 文本。
+// 输出: 同一结构; 有未读维护人员消息时在 notices 最前面插一张 id=chat-<报修码> 的卡, 并带顶层 chat:{code,state}。
+// 任何异常 → 原样输出 MWRT_BASE, 绝不拖垮别的通知。
+// 只读: 读 /tmp/mwrt-repair/chat.jsonl(聊天缓存)、chat.ack(设备端已读到的维护人员消息 id)、
+// chat.poll(最近一次服务器响应, 取状态与对端在线)、/etc/mwrt-repair/state(报修码与到期时间)。
+// 全部在 ucode 里按 JSON / 数字解析, 不经 shell, 没有命令注入点; 文件缺失 / 半写 / 损坏行 / 很大都容忍。
+//
+// 未读 = 会话状态为 approved 且存在 side=adm、id 大于 chat.ack 的消息。前端再把浏览器 localStorage 里
+// 页面写的 seen 并进来(取较大者)重新数, 所以这里把未读 id 清单(最多 50 个, 超出部分记在 more)一起给前端。
+// 状态判定与 luci.controller.mwrtrepair 的 derive_state 一致: 报修码在有效期内且 poll 状态为 approved 才算 approved。
+//
+// 环境变量改路径 / 时间, 仅供测试(生产不设): CHAT_SPOOL CHAT_ACK CHAT_POLL CHAT_STATE CHAT_NOW
+
+import { open, stat, lstat, readfile } from 'fs';
+
+const RAW = getenv('MWRT_BASE');
+
+function env(k, d) {
+	let v = getenv(k);
+	return (v != null && v != '') ? v : d;
+}
+
+const SPOOL = env('CHAT_SPOOL', '/tmp/mwrt-repair/chat.jsonl');
+const ACKF = env('CHAT_ACK', '/tmp/mwrt-repair/chat.ack');
+const POLL = env('CHAT_POLL', '/tmp/mwrt-repair/chat.poll');
+const STATEF = env('CHAT_STATE', '/etc/mwrt-repair/state');
+const TAILMAX = 32768;      // 聊天缓存很大时只读尾部这么多字节(worker 自己把它裁到 64KB 上下; 最新的消息在尾部, 这里只关心最近的未读)
+const TEXTMAX = 80;         // 预览最多 80 个字
+const IDSMAX = 50;          // 未读 id 清单最多给这么多个(取最新的)
+const LINK_FRESH = 60;      // chat.poll 多少秒内刷新过才算 worker 在线(与控制器一致)
+
+let now = int(env('CHAT_NOW', '0'));
+if (!(now > 0)) now = time();
+
+function to_id(v) {
+	if (type(v) != 'int' || v < 1 || v > 2147483647) return 0;
+	return v;
+}
+
+// 按 UTF-8 字(码点)截断到 max 个; 丢掉非法 UTF-8 字节 / 双向文字控制符, 控制字符折成单个空格。
+// 与 phone_uc 里的 clip() 同一实现(输出要进 json-c, 非法字节会让整条通知解析失败)。
+function clip(s, max) {
+	if (type(s) != 'string') return '';
+	let out = [], n = 0, i = 0, len = length(s), sp = true, cut = false;
+	while (i < len) {
+		let c = ord(s, i), sz = 1, ws = false, lo = 0x80, hi = 0xBF;
+		if (c < 0x80) {
+			ws = (c <= 0x20 || c == 0x7f);
+		} else if (c >= 0xC2 && c <= 0xDF) {
+			sz = 2;
+		} else if (c >= 0xE0 && c <= 0xEF) {
+			sz = 3;
+			if (c == 0xE0) lo = 0xA0;
+			if (c == 0xED) hi = 0x9F;
+		} else if (c >= 0xF0 && c <= 0xF4) {
+			sz = 4;
+			if (c == 0xF0) lo = 0x90;
+			if (c == 0xF4) hi = 0x8F;
+		} else {
+			i++;
+			continue;
+		}
+		if (sz > 1) {
+			if (i + sz > len) break;
+			let ok = true;
+			for (let k = 1; k < sz; k++) {
+				let cc = ord(s, i + k);
+				if (cc < (k == 1 ? lo : 0x80) || cc > (k == 1 ? hi : 0xBF)) { ok = false; break; }
+			}
+			if (!ok) { i++; continue; }
+			// 丢掉双向文字控制符 U+202A-202E / U+2066-2069(RTL 覆盖可把文字视觉上倒排)
+			if (c == 0xE2 && ((ord(s, i + 1) == 0x80 && ord(s, i + 2) >= 0xAA && ord(s, i + 2) <= 0xAE) ||
+			                  (ord(s, i + 1) == 0x81 && ord(s, i + 2) >= 0xA6 && ord(s, i + 2) <= 0xA9))) {
+				i += sz;
+				continue;
+			}
+			if (c == 0xC2 && ord(s, i + 1) < 0xA0) ws = true;       // C1 控制字符
+			// U+2028 / U+2029 行分隔符也当空白
+			if (c == 0xE2 && ord(s, i + 1) == 0x80 && (ord(s, i + 2) == 0xA8 || ord(s, i + 2) == 0xA9)) ws = true;
+		}
+		if (ws) {
+			if (!sp) { push(out, ' '); sp = true; }
+		} else {
+			if (n >= max) { cut = true; break; }
+			push(out, substr(s, i, sz));
+			n++;
+			sp = false;
+		}
+		i += sz;
+	}
+	while (length(out) && out[length(out) - 1] == ' ') pop(out);
+	return join('', out) + (cut ? '…' : '');
+}
+
+// 只接受 root 属主的普通文件(符号链接 / 目录 / 别人的文件一律当没有); 返回内容最多 max 字节。
+// tail=true 且文件超过 max 时只取尾部并丢掉被截断的第一行。
+function slurp(path, max, tail) {
+	let st = lstat(path);
+	if (!st || st.type != 'file' || st.uid != 0 || !(st.size > 0)) return null;
+	if (st.size <= max || !tail) return readfile(path, max);
+	let f = open(path, 'r');
+	if (!f) return null;
+	f.seek(st.size - max, 0);
+	let data = f.read(max) ?? '';
+	f.close();
+	let nl = index(data, "\n");
+	return nl >= 0 ? substr(data, nl + 1) : '';
+}
+
+function read_json(path, max) {
+	let raw = slurp(path, max, false);
+	if (raw == null) return null;
+	let o = null;
+	try { o = json(raw); } catch (e) { o = null; }
+	return type(o) == 'object' ? o : null;
+}
+
+// /etc/mwrt-repair/state: 每行 key=value, 取 code(8 位大写字母数字)与 exp(到期 epoch)
+function read_state() {
+	let raw = slurp(STATEF, 4096, false);
+	if (raw == null) return null;
+	let code = null, exp = 0;
+	for (let l in split(raw, "\n")) {
+		let m = match(trim(l), /^(code|exp)=([A-Z0-9]{1,12})$/);
+		if (!m) continue;
+		if (m[1] == 'code' && match(m[2], /^[A-Z0-9]{8}$/)) code = m[2];
+		else if (m[1] == 'exp' && match(m[2], /^[0-9]{1,12}$/)) exp = int(m[2]);
+	}
+	return code ? { code: code, active: exp > now } : null;
+}
+
+function main() {
+	let base = json(RAW);
+	if (type(base) != 'object') return RAW;
+	if (type(base.notices) != 'array') base.notices = [];
+
+	let ses = read_state();
+	if (!ses) return RAW;
+	let code = substr(ses.code, 0, 4) + '-' + substr(ses.code, 4, 4);
+
+	// 会话状态(与控制器 derive_state 一致): 有效期内 + 服务器报 approved/ended 用服务器的, 否则 pending; 过期 = ended
+	let poll = read_json(POLL, 8192);
+	let ps = (poll && poll.ok === true && (poll.state == 'approved' || poll.state == 'ended')) ? poll.state : '';
+	let state = ses.active ? (ps != '' ? ps : 'pending') : 'ended';
+	base.chat = { code: code, state: state };
+	if (state != 'approved') return sprintf('%.J', base);
+
+	// 设备端已读到的维护人员消息 id(聊天页发 chat_ack 后由 mwrt-repair 写入), 只认纯数字
+	let ack = 0;
+	let araw = slurp(ACKF, 32, false);
+	if (araw != null) {
+		araw = trim(araw);
+		if (match(araw, /^[0-9]{1,10}$/)) ack = int(araw);
+	}
+
+	// 逐行解析聊天缓存: 每行是一次长轮询响应 {last,msgs:[{id,ts,side,text,cid}],...}; 坏行(半截写入 / 乱码)跳过。
+	// 先只读尾部 4KB, 够用就停; 不够(最早读到的那行 last 仍大于 ack, 说明更早还可能有未读)再放大到 16KB、128KB。
+	// 「够用」= 整个文件都读到了 / 读到某一行 last <= ack(id 单调递增, 更早的行都已读) / 已经攒够 IDSMAX 条未读。
+	let unread = [];
+	for (let win in [4096, 16384, TAILMAX]) {
+		let st = lstat(SPOOL);
+		if (!st || st.type != 'file' || st.uid != 0 || !(st.size > 0)) return sprintf('%.J', base);
+		let data = slurp(SPOOL, win, true);
+		if (data == null) return sprintf('%.J', base);
+		let seen = {}, adm = [], covered = (st.size <= win);
+		for (let line in split(data, "\n")) {
+			line = trim(line);
+			if (substr(line, 0, 1) != '{') continue;
+			// 快速跳过: last 是该行响应时的最大消息 id, last <= ack 说明这一行没有未读, 不必解析 JSON
+			// (行首不是 {"last":N 的格式就老实解析, 不依赖这个优化)
+			let lm = match(line, /^\{"last": *([0-9]{1,10})[,}]/);
+			if (lm && int(lm[1]) <= ack) { covered = true; continue; }
+			let o = null;
+			try { o = json(line); } catch (e) { o = null; }
+			if (type(o) != 'object' || type(o.msgs) != 'array') continue;
+			for (let m in o.msgs) {
+				if (type(m) != 'object' || m.side != 'adm') continue;
+				let id = to_id(m.id);
+				if (!id || seen[id] || type(m.text) != 'string') continue;
+				seen[id] = true;
+				push(adm, { id: id, ts: to_id(m.ts), text: m.text });
+			}
+		}
+		adm = sort(adm, (a, b) => a.id - b.id);
+		unread = [];
+		for (let m in adm) if (m.id > ack) push(unread, m);
+		if (covered || length(unread) >= IDSMAX) break;
+	}
+	if (!length(unread)) return sprintf('%.J', base);
+
+	let latest = unread[length(unread) - 1];
+	let ids = [], more = 0;
+	for (let m in unread) push(ids, m.id);
+	if (length(ids) > IDSMAX) {
+		more = length(ids) - IDSMAX;
+		ids = slice(ids, more);
+	}
+
+	// 对端在线: chat.poll 最近 LINK_FRESH 秒内刷新过(worker 在线)且服务器报 peer_online
+	let online = false;
+	let pst = stat(POLL);
+	if (poll && poll.peer_online === true && pst && now - pst.mtime <= LINK_FRESH) online = true;
+
+	let pv = clip(latest.text, TEXTMAX);
+	unshift(base.notices, {
+		id: 'chat-' + ses.code, level: 'info', closable: true, icon: 'chat', link: 'chat',
+		title: '维护人员发来新消息',
+		text: pv != '' ? pv : '（无文字内容）',
+		ts: latest.ts,
+		chat: { code: code, state: state, ids: ids, more: more, max: latest.id, online: online }
+	});
+	return sprintf('%.J', base);
+}
+
+let result = RAW;
+try { result = main() ?? RAW; } catch (e) { result = RAW; }
+print(result, '\n');
+UCEOF
+}
+
+chat_merge() {
+	local out
+	if [ -s "$CHAT_SPOOL" ] && command -v ucode >/dev/null 2>&1; then
+		out="$(chat_uc "$1")"
+		if [ -n "$out" ]; then
+			echo "$out"
+			return
+		fi
+	fi
+	echo "$1"
+}
+# ---- s155 chat end ----
+
+# s201: NRadio C5800 外接 AK68 时给前端一个 ak68 标记(顶层字段), 前端据此给通知/短信/拨号/WEBUI 挂 AK68 角标、菜单改名。
+# 只认 C5800(不含 C8-668/688 等同类机型); 状态来自 mwrt-ak68 写的 /tmp/mwrt-ak68.json(present=1 才算在位)。其它机型原样返回。
+ak68_merge() {
+	local k
+	case "$(cat /tmp/sysinfo/board_name /tmp/sysinfo/model 2>/dev/null | tr 'A-Z' 'a-z')" in *c5800*) ;; *) echo "$1"; return ;; esac
+	[ "$(jsonfilter -i /tmp/mwrt-ak68.json -e '@.present' 2>/dev/null)" = "1" ] || { echo "$1"; return; }
+	k="$(jsonfilter -i /tmp/mwrt-ak68.json -e '@.kind' 2>/dev/null | tr -cd 'a-z0-9')"
+	echo "$1" | sed '1s/^{/{"ak68":{"kind":"'"$k"'"},/'
+}
+
+m_list() {
+	local v p
+	json_init
+	json_add_array notices
+	usb3_pending && add_notice usb3 critical 0 "$(usb3_text)" "" "$(usb3_progress)"
+	usb3_lost && add_notice usb3-lost critical 0 "$TXT_USB3_LOST"
+	sim_initializing && add_notice siminit warn 0 "$TXT_SIMINIT"
+	p="$(swap_progress)" && add_notice swapfile warn 0 "$(swap_text)" "" "$p"
+	wlb_event_notice
+	port_event_notice
+	if [ -s "$OTA_LATEST" ] && [ "$(jsonfilter -i "$OTA_LATEST" -e '@.update' 2>/dev/null)" = "true" ]; then
+		v="$(jsonfilter -i "$OTA_LATEST" -e '@.version' 2>/dev/null)"
+		[ -n "$v" ] && add_notice "ota-$v" info 1 "发现新固件 v$v" ota
+	fi
+	json_close_array
+	ak68_merge "$(chat_merge "$(phone_merge "$(json_dump)")")"
+}
+
+m_reboot_gate() {
+	json_init
+	if usb3_pending; then
+		json_add_boolean block 1
+		json_add_string reason "$TXT_GATE"
+	else
+		json_add_boolean block 0
+	fi
+	json_dump
+}
+
+case "$1" in
+	list)
+		json_init
+		json_add_object list; json_close_object
+		json_add_object reboot_gate; json_close_object
+		json_dump
+		;;
+	call)
+		case "$2" in
+			list) m_list ;;
+			reboot_gate) m_reboot_gate ;;
+			*) echo '{"error":"unknown method"}' ;;
+		esac
+		;;
+esac

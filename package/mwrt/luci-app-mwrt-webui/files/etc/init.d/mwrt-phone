@@ -1,0 +1,27 @@
+#!/bin/sh /etc/rc.common
+# mwrt-phone: 5700 通话/短信状态守护(s101)
+#
+# 停用:   /etc/init.d/mwrt-phone stop && /etc/init.d/mwrt-phone disable
+#         (再持久关掉: uci set mwrt.@ndis[0].phoneen=0 && uci commit mwrt,
+#          cron 自愈与 start_service 都会据此不再拉起)
+# 维护:   touch /tmp/mwrt-phone/maint 后 cron 自愈与 start_service 都不起守护(测试用,重启即消失)
+# 单例:   守护自己对 /tmp/mwrt-phone/daemon.lock 做 lockf,抢不到 exit 3(procd 每 5 秒重试一次,属预期)。
+#         不用 busybox flock 包一层: 它会 fork 子进程,procd stop 只杀 flock,守护会变孤儿。
+
+USE_PROCD=1
+START=99
+STOP=10
+
+start_service() {
+	mkdir -p /tmp/mwrt-phone
+	[ -e /tmp/mwrt-phone/maint ] && return 0
+	[ "$(uci -q get 'mwrt.@ndis[0].phoneen')" = "0" ] && return 0
+	/usr/bin/mwrt-phone-ctl present >/dev/null 2>&1 || return 0
+
+	procd_open_instance
+	procd_set_param command /usr/bin/mwrt-phoned
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}

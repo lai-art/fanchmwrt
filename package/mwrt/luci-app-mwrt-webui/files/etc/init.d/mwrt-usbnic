@@ -1,0 +1,23 @@
+#!/bin/sh /etc/rc.common
+# USB 网卡 / 手机共享的开机清扫 + 配置触发(没有常驻进程)。
+#   开机:      清掉上次留在 flash 里的残留接口 / 防火墙 / 网关存活占用, 再扫一遍已插着的口。
+#   mwrt 配置改动(「USB网口检测开关」): procd 触发 reload, 调一次 sync:
+#              开 -> 补扫已插着的口; 关 -> 清掉已建立的配置并恢复网关存活。
+# 写法同 /etc/init.d/mwrt-ledsched: 只用 procd 的配置触发器, 不注册实例。
+START=96
+USE_PROCD=1
+
+start_service() {
+	[ -x /usr/bin/mwrt-usbnic ] || return 0
+	# 放后台: 开机时 network 还没起完, 清扫里要等网络重载
+	/usr/bin/mwrt-usbnic boot >/dev/null 2>&1 &
+}
+
+service_triggers() {
+	procd_add_reload_trigger mwrt
+}
+
+reload_service() {
+	[ -x /usr/bin/mwrt-usbnic ] || return 0
+	/usr/bin/mwrt-usbnic sync >/dev/null 2>&1 &
+}

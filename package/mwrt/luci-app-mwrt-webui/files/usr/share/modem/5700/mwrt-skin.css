@@ -1,0 +1,379 @@
+/* s40 Mwrt 皮肤：5700 WEBUI(V2.2.2)外观统一层。index.html 在 umi.css 之后引入。
+   antd v5 的规则走 :where(.css-xxx)(特异性 0)，ProLayout 是 0,2,0；页面里大量写死的
+   inline 灰块(#f9f9f9 子卡片 / #f5f5f5 标题胶囊)只能 !important 压。
+   总览页(.mw-ov*)和 DHCP 卡(.mw-dh*)的样式也在这里。 */
+
+:root {
+  --mw-pri: #1890ff;
+  --mw-pri-bg: #e8f3ff;
+  --mw-text: #1d2129;
+  --mw-text-2: #4e5969;
+  --mw-text-3: #86909c;
+  --mw-line: #eef0f4;
+  --mw-bg: #f3f6fb;
+  --mw-card: #fff;
+  --mw-shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 4px 16px rgba(16, 24, 40, .06);
+  --mw-r: 12px;
+  --mw-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+/* ---------- 框架 ---------- */
+.ant-pro-layout .ant-pro-layout-bg-list { background: var(--mw-bg) !important; }
+.ant-pro-layout .ant-pro-layout-content { font-variant-numeric: tabular-nums; }
+.ant-pro-layout .ant-layout-sider.ant-pro-sider {
+  background: #fff !important;
+  border-inline-end: 1px solid var(--mw-line) !important;
+  box-shadow: 2px 0 12px rgba(16, 24, 40, .03);
+}
+.ant-pro-layout .ant-pro-sider-logo { padding-block: 18px 14px; border-block-end: 1px solid var(--mw-line); }
+.ant-pro-layout .ant-pro-sider-logo h1 { font-size: 15px; font-weight: 600; letter-spacing: .2px; color: var(--mw-text); }
+
+/* 分组标题：小号灰字 */
+.ant-pro-layout .ant-pro-sider-menu .ant-menu-item-group-title,
+.ant-pro-layout .ant-pro-base-menu-inline-group-item-title {
+  font-size: 12px !important;
+  color: var(--mw-text-3) !important;
+  letter-spacing: .3px;
+}
+.ant-pro-layout .ant-pro-sider-menu .ant-menu-item-group-title { padding-block: 14px 6px !important; }
+
+/* 菜单项：圆角 + 选中浅底 + 左侧竖条 */
+.ant-pro-layout .ant-pro-sider-menu .ant-menu-item {
+  border-radius: 8px !important;
+  margin-block: 2px !important;
+  transition: background .2s, color .2s;
+}
+.ant-pro-layout .ant-pro-sider-menu .ant-menu-item .anticon { font-size: 16px !important; }
+.ant-pro-layout .ant-pro-sider-menu .ant-menu-item-selected {
+  background: var(--mw-pri-bg) !important;
+  color: var(--mw-pri) !important;
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--mw-pri);
+}
+.ant-pro-layout .ant-pro-sider-menu .ant-menu-item-selected a,
+.ant-pro-layout .ant-pro-sider-menu .ant-menu-item-selected .anticon { color: var(--mw-pri) !important; }
+/* 折叠态：只剩图标，居中 */
+.ant-pro-layout .ant-layout-sider-collapsed .ant-pro-sider-menu .ant-menu-item {
+  display: flex !important;
+  justify-content: center;
+  align-items: center;
+  padding-inline: 0 !important;
+}
+.ant-pro-layout .ant-layout-sider-collapsed .ant-pro-sider-menu .ant-menu-item .anticon { font-size: 18px !important; margin: 0 !important; }
+
+/* 底部操作区：只剩语言图标 */
+.ant-pro-layout .ant-pro-sider-actions { border-block-start: 1px solid var(--mw-line); padding-block: 8px; }
+.mw-lang {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  color: var(--mw-text-2);
+  cursor: pointer;
+  transition: background .2s, color .2s;
+}
+.mw-lang:hover { background: rgba(24, 144, 255, .08); color: var(--mw-pri); }
+.mw-lang:focus-visible { outline: 2px solid var(--mw-pri); outline-offset: 1px; }
+
+.ant-pro-global-footer { margin-block: 24px 16px !important; }
+.ant-pro-global-footer-list-link { color: var(--mw-text-3) !important; }
+
+/* ---------- 通用组件 ---------- */
+.ant-pro-layout .ant-pro-layout-content .ant-card {
+  border-radius: var(--mw-r);
+}
+.ant-pro-layout .ant-pro-layout-content .ant-card:not(.ant-card-small):not(.ant-card-type-inner) {
+  border: none !important;
+  box-shadow: var(--mw-shadow);
+}
+/* 卡片里再套的默认尺寸卡片(锁频页的邻区扫描 / SSB 信息及其小格)不再二次浮起, 回到细边框 */
+.ant-pro-layout .ant-pro-layout-content .ant-card .ant-card:not(.ant-card-small):not(.ant-card-type-inner) {
+  border: 1px solid #edf1f7 !important;
+  box-shadow: none !important;
+}
+.ant-pro-layout .ant-pro-layout-content .ant-card:not(.ant-card-small) > .ant-card-head {
+  border-block-end: 1px solid var(--mw-line);
+  min-height: 52px;
+}
+/* 卡片标题前的竖条 */
+.ant-pro-layout .ant-pro-layout-content .ant-card:not(.ant-card-small) > .ant-card-head .ant-card-head-title {
+  position: relative;
+  padding-inline-start: 12px;
+  font-weight: 600;
+  color: var(--mw-text);
+}
+.ant-pro-layout .ant-pro-layout-content .ant-card:not(.ant-card-small) > .ant-card-head .ant-card-head-title::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: 0;
+  top: 50%;
+  width: 4px;
+  height: 16px;
+  margin-top: -8px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #40a9ff, #1890ff);
+}
+/* 标题右边那颗写死 #f5f5f5 的说明胶囊 */
+.inner-card > .ant-card-head .ant-card-head-title > div > div {
+  background: #f2f6fd !important;
+  color: #5b6b85 !important;
+  border-radius: 999px !important;
+  padding: 1px 10px !important;
+  font-size: 12px !important;
+}
+/* 页面里写死 #f9f9f9 / #fafafa / #f5f5f5 底色的子卡片 */
+.ant-pro-layout-content .ant-card[style*="249, 249, 249"],
+.ant-pro-layout-content .ant-card[style*="#f9f9f9"],
+.ant-pro-layout-content .ant-card[style*="250, 250, 250"],
+.ant-pro-layout-content .ant-card[style*="#fafafa"],
+.ant-pro-layout-content .ant-card[style*="245, 245, 245"] {
+  background: #f7f9fc !important;
+  border: 1px solid #edf1f7 !important;
+  border-radius: 10px !important;
+  box-shadow: none !important;
+}
+.ant-pro-layout-content .ant-card-small > .ant-card-head { border-block-end-color: #edf1f7; }
+.ant-pro-layout-content .ant-card-small > .ant-card-head .ant-card-head-title { font-size: 13px; color: var(--mw-text-2); }
+.ant-pro-layout-content .temperature-card { border-radius: 10px !important; }
+
+.ant-pro-layout .ant-btn { border-radius: 8px; }
+.ant-pro-layout .ant-btn-sm { border-radius: 6px; }
+.ant-pro-layout .ant-input,
+.ant-pro-layout .ant-input-affix-wrapper,
+.ant-pro-layout .ant-input-number,
+.ant-pro-layout .ant-select:not(.ant-select-customize-input) .ant-select-selector,
+.ant-pro-layout .ant-picker { border-radius: 8px; }
+.ant-pro-layout .ant-table-wrapper .ant-table { border-radius: 10px; overflow: hidden; }
+.ant-pro-layout .ant-table-wrapper .ant-table-thead > tr > th { background: #f7f9fc; color: var(--mw-text-2); font-weight: 600; }
+.ant-pro-layout .ant-tag { border-radius: 6px; }
+.ant-pro-layout .ant-alert { border-radius: 10px; }
+.ant-pro-layout .ant-statistic-content { font-variant-numeric: tabular-nums; }
+.ant-modal .ant-modal-content { border-radius: 14px; }
+
+/* ---------- 总览页 ---------- */
+.mw-ov { max-width: 1440px; margin: 0 auto; padding: 4px 0 8px; color: var(--mw-text); }
+.mw-ov * { box-sizing: border-box; }
+.mw-mono { font-family: var(--mw-mono); }
+.mw-ov-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.mw-ov-t { margin: 0; font-size: 22px; font-weight: 700; line-height: 1.3; color: var(--mw-text); }
+.mw-ov-s { margin: 2px 0 0; font-size: 13px; color: var(--mw-text-3); }
+.mw-live {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 12px; border-radius: 999px;
+  background: #fff; box-shadow: var(--mw-shadow);
+  font-size: 12px; color: var(--mw-text-2);
+}
+.mw-live i { width: 8px; height: 8px; border-radius: 50%; background: #c0c6d0; }
+.mw-live.on i { background: #52c41a; box-shadow: 0 0 0 0 rgba(82, 196, 26, .5); animation: mw-pulse 2s infinite; }
+@keyframes mw-pulse { 0% { box-shadow: 0 0 0 0 rgba(82, 196, 26, .45); } 70% { box-shadow: 0 0 0 7px rgba(82, 196, 26, 0); } 100% { box-shadow: 0 0 0 0 rgba(82, 196, 26, 0); } }
+@media (prefers-reduced-motion: reduce) { .mw-live.on i { animation: none; } .mw-ring-fg { transition: none !important; } }
+
+.mw-ov-bar { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
+.mw-stat {
+  display: flex; align-items: center; gap: 12px; min-width: 0;
+  padding: 16px 18px; border-radius: var(--mw-r); background: var(--mw-card); box-shadow: var(--mw-shadow);
+}
+.mw-stat-ic { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border-radius: 11px; font-size: 22px; }
+.mw-stat-b { min-width: 0; }
+.mw-stat-k { font-size: 12px; color: var(--mw-text-3); }
+.mw-stat-v { font-size: 16px; font-weight: 600; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mw-stat-s { font-size: 12px; color: var(--mw-text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* 未注册基站提示(欠费/停机/无覆盖) */
+.mw-warn { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 16px; padding: 12px 16px; border-radius: var(--mw-r); border: 1px solid #ffe7ba; background: #fffbe6; }
+.mw-warn-ic { flex: none; display: inline-flex; font-size: 20px; color: #fa8c16; margin-top: 1px; }
+.mw-warn b { font-size: 14px; font-weight: 600; color: #ad4e00; }
+.mw-warn p { margin: 2px 0 0; font-size: 12px; line-height: 1.6; color: var(--mw-text-2); }
+.mw-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; }
+.mw-s4 { grid-column: span 4; } .mw-s5 { grid-column: span 5; } .mw-s7 { grid-column: span 7; } .mw-s8 { grid-column: span 8; }
+.mw-c { min-width: 0; padding: 18px 20px 20px; border-radius: var(--mw-r); background: var(--mw-card); box-shadow: var(--mw-shadow); }
+.mw-c-h { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 16px; }
+.mw-c-t { position: relative; margin: 0; padding-inline-start: 12px; font-size: 15px; font-weight: 600; color: var(--mw-text); }
+.mw-c-t::before { content: ""; position: absolute; inset-inline-start: 0; top: 50%; width: 4px; height: 15px; margin-top: -7.5px; border-radius: 2px; background: linear-gradient(180deg, #40a9ff, #1890ff); }
+.mw-chip { display: inline-block; padding: 1px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--mw-pri-bg); color: var(--mw-pri); }
+.mw-chip-p { background: #f3ecff; color: #722ed1; }
+
+/* 信号环 */
+.mw-rings { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.mw-ring { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.mw-ring-box { position: relative; width: 100%; max-width: 132px; aspect-ratio: 1 / 1; }
+.mw-ring-box svg { display: block; width: 100%; height: 100%; transform: rotate(-90deg); }
+.mw-ring-bg { fill: none; stroke: #eef1f6; stroke-width: 10; }
+.mw-ring-fg { fill: none; stroke-width: 10; stroke-linecap: round; transition: stroke-dashoffset .6s ease, stroke .3s; }
+.mw-ring-c { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.mw-ring-c b { font-size: 24px; font-weight: 700; line-height: 1.1; }
+.mw-ring-c small { font-size: 12px; color: var(--mw-text-3); }
+.mw-ring-l { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--mw-text-2); }
+.mw-ring-l i { font-style: normal; font-size: 12px; font-weight: 600; padding: 0 8px; border-radius: 999px; line-height: 20px; }
+
+/* 服务小区 */
+.mw-cell { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 8px; }
+.mw-band { font-size: 36px; font-weight: 700; line-height: 1.1; letter-spacing: .5px; background: linear-gradient(90deg, #1890ff, #722ed1); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.mw-band-s { display: flex; gap: 8px; flex-wrap: wrap; }
+.mw-band-s span { padding: 2px 10px; border-radius: 6px; background: #f5f7fa; font-size: 13px; color: var(--mw-text-2); }
+.mw-ca { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.mw-ca-i { font-size: 12px; color: #722ed1; background: #f8f4ff; border-radius: 6px; padding: 1px 8px; }
+.mw-kvg { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; margin-top: 14px; }
+.mw-kvg-dev { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); margin-top: 0; }
+.mw-kv { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 10px 12px; border-radius: 10px; background: #f7f9fc; }
+.mw-kv-k { font-size: 12px; color: var(--mw-text-3); }
+.mw-kv-v { font-size: 14px; font-weight: 600; color: var(--mw-text); word-break: break-all; }
+
+/* 实时流量 */
+.mw-legend { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--mw-text-3); }
+.mw-legend i { width: 10px; height: 3px; border-radius: 2px; margin-inline-start: 6px; }
+.mw-legend i.d { background: #1890ff; } .mw-legend i.u { background: #13c2a3; }
+.mw-rate { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+.mw-rate-i { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 10px; }
+.mw-rate-i.d { background: #f0f7ff; } .mw-rate-i.u { background: #ecfbf7; }
+.mw-rate-ic { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 50%; font-size: 18px; color: #fff; }
+.mw-rate-i.d .mw-rate-ic { background: #1890ff; } .mw-rate-i.u .mw-rate-ic { background: #13c2a3; }
+.mw-rate-i small { display: block; font-size: 12px; color: var(--mw-text-3); }
+.mw-rate-i b { font-size: 20px; font-weight: 700; white-space: nowrap; }
+.mw-spark { position: relative; height: 128px; border-radius: 10px; background: #fbfcfe; border: 1px solid #f0f2f6; overflow: hidden; }
+.mw-spark svg { display: block; width: 100%; height: 100%; }
+.mw-spark-g { stroke: #eef1f6; stroke-width: 1; stroke-dasharray: 4 4; vector-effect: non-scaling-stroke; }
+.mw-spark-d, .mw-spark-u { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.mw-spark-d { stroke: #1890ff; } .mw-spark-u { stroke: #13c2a3; }
+.mw-spark-max { position: absolute; top: 6px; inset-inline-end: 10px; font-size: 11px; color: var(--mw-text-3); background: rgba(255, 255, 255, .8); padding: 0 6px; border-radius: 4px; }
+.mw-spark-empty { display: flex; align-items: center; justify-content: center; font-size: 13px; color: var(--mw-text-3); }
+.mw-flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.mw-flow > div { min-width: 0; }
+.mw-flow small { display: block; font-size: 12px; color: var(--mw-text-3); }
+.mw-flow b { font-size: 14px; font-weight: 600; white-space: pre; }
+
+/* 温度 */
+.mw-temp { display: flex; align-items: center; gap: 14px; margin: 6px 0 18px; }
+.mw-temp-ic { display: inline-flex; align-items: center; justify-content: center; width: 52px; height: 52px; border-radius: 14px; background: #f7f9fc; font-size: 30px; }
+.mw-temp b { font-size: 34px; font-weight: 700; line-height: 1; }
+.mw-temp small { font-size: 15px; color: var(--mw-text-3); }
+.mw-temp-s { margin-top: 6px; font-size: 12px; color: var(--mw-text-3); }
+.mw-tbar { height: 8px; border-radius: 4px; background: #eef1f6; overflow: hidden; }
+.mw-tbar i { display: block; height: 100%; border-radius: 4px; transition: width .6s ease; }
+.mw-tbar-s { display: flex; justify-content: space-between; margin-top: 6px; font-size: 11px; color: var(--mw-text-3); }
+
+/* 快捷入口 */
+.mw-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.mw-tile {
+  display: flex; align-items: center; gap: 10px; min-width: 0;
+  padding: 12px; border-radius: 10px; border: 1px solid #eef1f6;
+  color: var(--mw-text) !important; transition: background .2s, border-color .2s, transform .2s;
+}
+.mw-tile:hover { background: #f7f9fc; border-color: #dbe8ff; transform: translateY(-1px); }
+.mw-tile:focus-visible { outline: 2px solid var(--mw-pri); outline-offset: 1px; }
+.mw-tile-ic { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 9px; font-size: 18px; }
+.mw-tile-t { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mw-tile-a { color: var(--mw-text-3); font-size: 18px; display: inline-flex; }
+
+@media (max-width: 1199px) {
+  .mw-ov-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* 温度卡(半宽)后面是整行的设备卡，dense 让「快捷入口」回填到温度卡右边 */
+  .mw-grid { grid-auto-flow: row dense; }
+  .mw-s4, .mw-s5, .mw-s7 { grid-column: span 6; }
+  .mw-s8 { grid-column: span 12; }
+}
+@media (max-width: 767px) {
+  .mw-ov-bar { gap: 10px; }
+  .mw-stat { padding: 12px; gap: 10px; }
+  .mw-stat-ic { width: 36px; height: 36px; font-size: 19px; }
+  .mw-stat-v { font-size: 14px; }
+  .mw-grid { gap: 12px; }
+  .mw-s4, .mw-s5, .mw-s7, .mw-s8 { grid-column: span 12; }
+  .mw-c { padding: 14px 14px 16px; }
+  .mw-ring-c b { font-size: 20px; }
+  .mw-flow { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .mw-rate-i b { font-size: 17px; }
+}
+@media (max-width: 420px) {
+  .mw-ov-bar { grid-template-columns: minmax(0, 1fr); }
+  .mw-rate { grid-template-columns: minmax(0, 1fr); }
+  .mw-kvg { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ---------- 网络状态 · DHCP 卡 ---------- */
+.mw-dhcp .mw-na { display: inline-block; padding: 0 8px; border-radius: 999px; background: #f2f4f7; color: #a0a7b4; font-size: 12px; font-family: inherit; line-height: 20px; }
+.mw-dh-cap { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; color: #389e0d; background: #f6ffed; border: 1px solid #d9f7be; }
+.mw-dh-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.mw-dh-col { min-width: 0; padding: 16px 18px 8px; border-radius: 12px; border: 1px solid; }
+.mw-dh-v4 { --mw-k: #1890ff; --mw-k1: rgba(24, 144, 255, .1); --mw-k2: rgba(24, 144, 255, .18); border-color: #d6e8ff; background: linear-gradient(180deg, #f2f8ff 0, #fff 120px); }
+.mw-dh-v6 { --mw-k: #722ed1; --mw-k1: rgba(114, 46, 209, .1); --mw-k2: rgba(114, 46, 209, .18); border-color: #e6dcfa; background: linear-gradient(180deg, #f8f4ff 0, #fff 120px); }
+.mw-dh-ch { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.mw-dh-badge { padding: 1px 9px; border-radius: 6px; font-size: 12px; font-weight: 700; color: #fff; background: var(--mw-k); letter-spacing: .3px; }
+.mw-dh-ct { font-size: 14px; font-weight: 600; color: var(--mw-text); }
+.mw-dh-addr small { display: block; font-size: 12px; color: var(--mw-text-3); margin-bottom: 2px; }
+.mw-dh-av { display: flex; align-items: center; gap: 8px; min-height: 34px; margin-bottom: 8px; }
+.mw-dh-av > .mw-mono { font-size: 20px; font-weight: 700; color: var(--mw-k); word-break: break-all; line-height: 1.3; }
+.mw-copy {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; padding: 0; border: none; border-radius: 8px; cursor: pointer;
+  font-size: 15px; color: var(--mw-k); background: var(--mw-k1);
+  transition: background .2s;
+}
+.mw-copy:hover { background: var(--mw-k2); }
+.mw-copy:focus-visible { outline: 2px solid var(--mw-k); outline-offset: 1px; }
+.mw-dk { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-block-start: 1px dashed #e8ecf3; }
+.mw-dk-k { flex: none; font-size: 13px; color: var(--mw-text-3); }
+.mw-dk-v { display: inline-flex; align-items: center; gap: 6px; min-width: 0; text-align: end; font-size: 13px; font-weight: 600; color: var(--mw-text); }
+.mw-dk-v .mw-mono { word-break: break-all; }
+.mw-dk-tag { font-style: normal; font-size: 11px; font-weight: 600; padding: 0 6px; border-radius: 4px; color: var(--mw-k); background: var(--mw-k1); }
+.mw-dh-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 24px; margin-top: 16px; padding: 12px 16px; border-radius: 10px; background: #f7f9fc; }
+.mw-dh-fl { font-size: 13px; color: var(--mw-text-3); }
+.mw-dh-r { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--mw-text-2); }
+.mw-dh-r svg { font-size: 16px; }
+.mw-dh-r.d svg { color: #1890ff; } .mw-dh-r.u svg { color: #13c2a3; }
+.mw-dh-r b { font-size: 15px; font-family: var(--mw-mono); color: var(--mw-text); }
+.mw-dh-note { margin-left: auto; font-size: 12px; color: var(--mw-text-3); }
+@media (max-width: 767px) {
+  .mw-dh-grid { grid-template-columns: minmax(0, 1fr); }
+  .mw-dh-av > .mw-mono { font-size: 17px; }
+}
+
+/* ---------- s146 手机端(嵌在 LuCI 里大约 380 宽) ----------
+   拨号/系统页的 bordered 描述表在窄屏下标签列被挤成一字一行、输入框被截；
+   这里把每一行改成 flex：标签固定 88px，值吃掉剩下的宽度，一组标签+值占满一行，
+   同一行里的第二组自动换到下一行(补上边框)。只动 max-width:767px，桌面不受影响。 */
+@media (max-width: 767px) {
+  .ant-pro-layout .ant-pro-layout-content .ant-card:not(.ant-card-small) > .ant-card-head { padding: 0 14px !important; min-height: 46px; }
+  .ant-pro-layout .ant-pro-layout-content .ant-card:not(.ant-card-small) > .ant-card-body:not([style*="padding"]) { padding: 14px !important; }
+  .ant-pro-layout .ant-card .ant-card-head-wrapper { flex-wrap: wrap; row-gap: 4px; }
+  .ant-pro-layout .ant-card .ant-card-head-title { min-width: 0; }
+  /* 信息页标题右边的说明胶囊在手机上和右侧按钮抢位置，收起 */
+  .inner-card > .ant-card-head .ant-card-head-title > div > div { display: none !important; }
+
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-view { overflow: hidden; }
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-view > table,
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-view > table > tbody { display: block; width: 100% !important; table-layout: auto !important; }
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-row { display: flex; flex-wrap: wrap; }
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-item-label {
+    display: flex !important; align-items: center;
+    flex: 0 0 88px; width: 88px !important; box-sizing: border-box;
+    padding: 10px 12px !important; font-size: 13px; line-height: 1.4; word-break: keep-all;
+  }
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-item-content {
+    display: block !important; flex: 1 1 calc(100% - 88px); min-width: 0; box-sizing: border-box;
+    padding: 10px 12px !important; word-break: break-word; border-inline-end: 0 !important;
+  }
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-item-label:not(:first-child),
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-item-label:not(:first-child) + .ant-descriptions-item-content { border-top: 1px solid rgba(5, 5, 5, .06); }
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-item-content .ant-select,
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-item-content .ant-input,
+  .ant-pro-layout-content .ant-descriptions-bordered .ant-descriptions-item-content .ant-input-affix-wrapper { max-width: 100%; min-width: 0; }
+
+  /* 温度卡：一行两张 */
+  .ant-col:has(> .temperature-card) { flex: 0 0 50% !important; max-width: 50% !important; }
+  .temperature-card { margin: 0 !important; }
+  .temperature-card .ant-card-body { padding: 10px 12px !important; }
+  .temperature-card .ant-statistic-content { font-size: 20px !important; }
+
+  /* AT 终端：输入框单独一行，三个按钮平分下一行 */
+  .ant-space-compact:has(> .ant-input-compact-first-item) { flex-wrap: wrap; row-gap: 8px; }
+  .ant-space-compact > .ant-input-compact-first-item { flex: 1 1 100% !important; border-radius: 8px !important; margin-inline-end: 0 !important; }
+  .ant-space-compact:has(> .ant-input-compact-first-item) > .ant-btn { flex: 1 1 0; }
+  .ant-space-compact:has(> .ant-input-compact-first-item) > .ant-btn.ant-btn-compact-item:nth-child(2) { border-start-start-radius: 8px; border-end-start-radius: 8px; }
+
+  .ant-pro-layout .ant-alert-with-description { padding: 12px 14px !important; }
+  /* 系统页最外层栅格自带 8px 列内边距，卡片比别的页面多缩进一截 */
+  .ant-pro-layout-content > .ant-row[style*="margin: 0px"] > .ant-col { padding-inline: 0 !important; }
+}

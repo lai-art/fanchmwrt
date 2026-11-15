@@ -1,0 +1,453 @@
+#!/bin/sh
+#
+# /usr/libexec/mwrt-fun —— 趣玩中心：向更新服务器拉取菜单配置
+#
+# 服务器接口: GET <server>/api/v1/fun -> {"enabled":bool,"items":[{id,name,url,mode}],"ver":epoch}
+# 服务器地址与在线更新、解锁养猫菜单共用 uci mwrt_ota.main.server（Mwrt服务器配置里改），
+# 只走 https + 内置 CA(/etc/mwrt/ota-ca.pem)，不用 -k。
+#
+# 结果缓存在 /tmp/mwrt-fun/fun.json（重启即清）。菜单由 luci.controller.mwrtfun 的 index()
+# 读这份缓存生成，所以缓存一变就要清 LuCI 的菜单索引缓存，菜单才会跟着变。
+#
+# 子命令:
+#   manual       侧栏 funny 按钮触发。真正去问服务器；两次之间至少隔 MIN_GAP 秒，
+#                洪水般的点击只会返回缓存结果。拉不到/服务器关闭 => 立即撤掉菜单。
+#   cron         每小时由 cron 叫一次：开机后查一次，之后满 24 小时才查。失败保留旧菜单。
+#   boot         网口 up 时由 hotplug 后台叫起：等对时后查一次（失败隔几十秒重试，最多约 12 次）。
+#   state        输出当前缓存状态（给页面用）。
+#   probe <url>  测试连接某个服务器地址（Mwrt服务器配置页的“测试连接”）。
+#   reset        换服务器后清掉旧服务器的缓存和菜单。
+#   sync         mwrt 配置提交后由 /etc/init.d/mwrt-fun 叫起（任何选项的保存都会走到这里）：
+#                关 -> 清缓存和菜单；关 -> 开(开关值真的变了才算) -> 立刻问一次服务器，
+#                拿到锁后再确认没有成功缓存、且离上次联网尝试满 MIN_GAP 秒。
+#                开关本来就是开的(只是改了别的选项) -> 什么都不做，不联网。
+#                退出码 2 = 该联网但没成功(未对时/拉取失败)，调用方接着起 boot 做重试。
+#
+# 总开关(s96)：uci mwrt.@ndis[0].funen，在「Mwrt设定 -> 界面与趣玩」里改，默认关（没有这个选项等同关闭）。
+# 关闭时 manual/cron/boot 在入口就退出，不联系服务器，并把残留的缓存和菜单清掉；
+# probe（服务器配置页的“测试连接”）和 reset 不受开关影响。
+#
+# 每个子命令都向 stdout 吐一行 JSON（cron/boot 除外）。
+
+. /usr/share/libubox/jshn.sh
+
+CA=/etc/mwrt/ota-ca.pem
+D=/tmp/mwrt-fun
+CUR=$D/fun.json
+LASTOK=$D/last.ok
+LASTTRY=$D/last.try
+LASTERR=$D/last.err
+FUNSTATE=$D/funen.last      # sync 上次看到的开关值(0/1)；purge 不清它，所以能认出“值真的变了”
+PROBETRY=$D/probe.try
+LOCK=$D/lock
+BOOTLOCK=$D/boot.lock
+
+DEFAULT_SERVER=https://103.233.254.163
+MAXN=20                      # 与服务器 FUN_MAX 一致
+MIN_GAP=30                   # 手动拉取的最小间隔(秒)
+AUTO_EVERY=$((86400 - 600))  # 自动检查间隔 24h，减 10 分钟容差
+
+ERR=
+
+u() { uci -q get "$1" 2>/dev/null; }
+
+# https://主机[:端口]，整串匹配（用 case，不用 grep：grep 按行匹配，带换行的值能蒙混过关）
+valid_server() {
+	local h=${1#https://}
+	case "$1" in https://?*) ;; *) return 1 ;; esac
+	case "$h" in *[!][A-Za-z0-9.:_-]*) return 1 ;; esac
+	return 0
+}
+
+server() {
+	local s
+	s=$(u mwrt_ota.main.server)
+	[ -n "$s" ] || s=$DEFAULT_SERVER
+	s=${s%/}
+	# 与 fancontrol.lua 的 Outofnetwork 同一个格式闸门
+	valid_server "$s" || return 1
+	printf '%s' "$s"
+}
+
+cur_build() {
+	local b
+	b=$(. /usr/lib/os-release 2>/dev/null; echo "$OPENWRT_BUILD_DATE")
+	case "$b" in ''|*[!0-9]*) b=0 ;; esac
+	echo "$b"
+}
+
+# 趣玩中心总开关。只认明确的 1：选项不存在/为空/为 0 都算关（默认关）
+fun_on() { [ "$(u 'mwrt.@ndis[0].funen')" = 1 ]; }
+
+# 距上次联网尝试是否已满 MIN_GAP 秒（时钟回拨导致差值为负时当作已满）
+gap_ok() {
+	local now last
+	now=$(date +%s)
+	last=$(cat "$LASTTRY" 2>/dev/null || echo 0)
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	[ $((now - last)) -ge "$MIN_GAP" ] || [ $((now - last)) -lt 0 ]
+}
+
+# 自动检查是否到期：从没成功过，或离上次成功满 AUTO_EVERY
+auto_due() {
+	local now last
+	now=$(date +%s)
+	last=$(cat "$LASTOK" 2>/dev/null || echo 0)
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	[ $((now - last)) -ge "$AUTO_EVERY" ]
+}
+
+# 时钟早于固件构建时间 => 还没对时，TLS 证书校验必然失败，别去问
+synced() { [ "$(date +%s)" -ge "$(cur_build)" ]; }
+
+lock() {
+	local i=0 p
+	mkdir -p "$D"
+	while ! mkdir "$LOCK" 2>/dev/null; do
+		# pid 为空 = 持有者刚 mkdir 还没来得及写 pid，当作还在用，不当陈旧锁删
+		p=$(cat "$LOCK/pid" 2>/dev/null)
+		if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
+		i=$((i + 1))
+		[ "$i" -gt 20 ] && return 1
+		sleep 1
+	done
+	echo $$ > "$LOCK/pid"
+	return 0
+}
+
+# 只释放自己持有的锁，免得误删别人刚拿到的
+unlock() { [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"; return 0; }
+
+# LuCI 的菜单索引缓存；controller 的 index() 只在重建索引时才会被调用
+flush_menu() { rm -f /tmp/luci-indexcache* 2>/dev/null; }
+
+cache_enabled() { jsonfilter -i "$CUR" -e '@.enabled' 2>/dev/null; }
+
+cache_count() {
+	local n
+	n=$(jsonfilter -i "$CUR" -e '@.items[*].id' 2>/dev/null | wc -l)
+	echo "${n:-0}"
+}
+
+# 把缓存换成 $1（已写好的新文件）；有变化返回 0 并清菜单索引，无变化返回 1
+install_cache() {
+	if [ -f "$CUR" ] && cmp -s "$1" "$CUR"; then rm -f "$1"; return 1; fi
+	mv -f "$1" "$CUR"
+	flush_menu
+	return 0
+}
+
+# 关闭时把缓存和菜单清干净。缓存本来就有才算“菜单有变化”(返回 0)并清菜单索引；
+# 没有缓存说明菜单本来就不在，什么都不用动(返回 1)，免得每次改 mwrt 配置都白白重建一遍菜单索引
+purge_cache() {
+	local had=1
+	[ -f "$CUR" ] && had=0
+	rm -f "$CUR" "$LASTOK" "$LASTTRY" "$LASTERR" "$D/new.json" "$D/fetch.tmp"
+	[ "$had" = 0 ] && flush_menu
+	return "$had"
+}
+
+# manual/cron/boot 的入口闸门：开关关着就清残留并返回 1，调用方直接退出
+gate() {
+	fun_on && return 0
+	purge_cache && GATE_CHANGED=1
+	return 1
+}
+
+# 自动路径(cron/boot/sync)用的拉取：失败原因记进 LASTERR。
+# ERR=disabled 是“拉取途中开关被关了”，不是网络故障：不记 LASTERR，并把残留清干净
+# （LASTTRY 可能是在 purge 之后才写的，不清会留下残文件）
+fetch_logged() {
+	do_fetch && return 0
+	if [ "$ERR" = disabled ]; then
+		purge_cache
+	else
+		echo "$ERR" > "$LASTERR"
+	fi
+	return 1
+}
+
+write_disabled() {
+	printf '{"enabled":false,"items":[]}\n' > "$D/new.json"
+	install_cache "$D/new.json"
+}
+
+# 服务器给的内容不信任：id/名称/网址/打开方式逐项在设备上再校验一遍，不合格的整项丢弃
+normalize() { # <服务器回复文件> => 写 $D/new.json
+	local f=$1 en i=0 n=0 id name url mode seen=" "
+	en=$(jsonfilter -i "$f" -e '@.enabled' 2>/dev/null)
+	json_init
+	if [ "$en" = true ]; then json_add_boolean enabled 1; else json_add_boolean enabled 0; fi
+	json_add_array items
+	if [ "$en" = true ]; then
+		while [ "$i" -lt "$MAXN" ]; do
+			id=$(jsonfilter -i "$f" -e "@.items[$i].id" 2>/dev/null)
+			name=$(jsonfilter -i "$f" -e "@.items[$i].name" 2>/dev/null)
+			url=$(jsonfilter -i "$f" -e "@.items[$i].url" 2>/dev/null)
+			mode=$(jsonfilter -i "$f" -e "@.items[$i].mode" 2>/dev/null)
+			i=$((i + 1))
+			[ -n "$id$name$url" ] || break
+			case "$id" in f[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) continue ;; esac
+			case "$seen" in *" $id "*) continue ;; esac
+			name=$(printf '%s' "$name" | tr -d '\000-\037\177' | sed "s/[<>\"&\\\\']//g")
+			[ -n "$name" ] && [ "$(printf '%s' "$name" | wc -c)" -le 64 ] || continue
+			case "$url" in http://?*|https://?*) ;; *) continue ;; esac
+			case "$url" in *[[:space:][:cntrl:]\<\>\"\'\\\`]*) continue ;; esac
+			[ "$(printf '%s' "$url" | wc -c)" -le 500 ] || continue
+			[ "$mode" = window ] || mode=embed
+			seen="$seen$id "
+			json_add_object ""
+			json_add_string id "$id"
+			json_add_string name "$name"
+			json_add_string url "$url"
+			json_add_string mode "$mode"
+			json_close_object
+			n=$((n + 1))
+		done
+	fi
+	json_close_array
+	json_dump > "$D/new.json"
+}
+
+# 问一次服务器。成功返回 0（缓存已更新，$CHANGED=1 表示菜单有变化）；失败返回 1，原因在 $ERR
+do_fetch() {
+	local s code rc tmp=$D/fetch.tmp
+	CHANGED=0
+	fun_on || { ERR=disabled; return 1; }
+	s=$(server) || { ERR=bad_server; return 1; }
+	[ -f "$CA" ] || { ERR=no_ca; return 1; }
+	# 回复最多 64KB（正常几百字节）：服务器出问题或被劫持时不让它把 /tmp(内存) 写满；只走 https
+	code=$(curl -sS --proto =https --max-filesize 65536 --cacert "$CA" -m 10 -o "$tmp" -w '%{http_code}' \
+		-H 'Cache-Control: no-cache' "$s/api/v1/fun" 2>/dev/null)
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		rm -f "$tmp"
+		case "$rc" in
+			63) ERR=bad_reply ;;
+			28) ERR=timeout ;;
+			35|51|58|59|60|77|83|90|91) ERR=tls ;;
+			*) ERR=nonet ;;
+		esac
+		return 1
+	fi
+	case "$code" in
+		200) ;;
+		429) rm -f "$tmp"; ERR=busy; return 1 ;;
+		*) rm -f "$tmp"; ERR="http_$code"; return 1 ;;
+	esac
+	if ! jsonfilter -i "$tmp" -e '@.enabled' >/dev/null 2>&1; then
+		rm -f "$tmp"; ERR=bad_reply; return 1
+	fi
+	# 联网这几秒里开关可能刚被关掉：不能再把菜单写回缓存
+	fun_on || { rm -f "$tmp"; ERR=disabled; return 1; }
+	normalize "$tmp"
+	rm -f "$tmp"
+	install_cache "$D/new.json" && CHANGED=1
+	date +%s > "$LASTOK"
+	rm -f "$LASTERR"
+	return 0
+}
+
+state_json() { # 当前缓存状态，经 jshn 输出到 stdout
+	local en=0 n=0
+	if [ -f "$CUR" ]; then
+		[ "$(cache_enabled)" = true ] && en=1
+		n=$(cache_count)
+	fi
+	json_add_boolean enabled "$en"
+	json_add_int count "$n"
+	# 当前缓存里的菜单项 id（逗号分隔）：页面据此和侧栏现有的趣玩子项比对，不一致就重画
+	local ids=
+	[ "$en" = 1 ] && ids=$(jsonfilter -i "$CUR" -e '@.items[*].id' 2>/dev/null | tr '\n' ',')
+	json_add_string ids "${ids%,}"
+	json_add_int last_ok "$(cat "$LASTOK" 2>/dev/null || echo 0)"
+	json_add_int last_try "$(cat "$LASTTRY" 2>/dev/null || echo 0)"
+	json_add_string last_err "$(cat "$LASTERR" 2>/dev/null)"
+}
+
+cmd_state() {
+	json_init
+	json_add_boolean ok 1
+	state_json
+	json_dump
+}
+
+cmd_manual() {
+	local now last gap
+	json_init
+	if ! gate; then
+		# 开关关着：不联系服务器，直接告诉前端“已关闭”（前端据此撤掉 funny 按钮，不当成网络故障）
+		json_add_boolean ok 0
+		json_add_string error disabled
+		json_add_boolean changed "${GATE_CHANGED:-0}"
+		state_json
+		json_dump
+		return
+	fi
+	lock || { json_add_boolean ok 0; json_add_string error busy; json_dump; return; }
+	now=$(date +%s)
+	last=$(cat "$LASTTRY" 2>/dev/null || echo 0)
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	gap=$((now - last))
+	if [ "$gap" -ge 0 ] && [ "$gap" -lt "$MIN_GAP" ]; then
+		# 太频繁：不去问服务器，返回上一次的结果
+		json_add_boolean ok 1
+		json_add_boolean throttled 1
+		json_add_int retry_after $((MIN_GAP - gap))
+		json_add_boolean changed 0
+		[ -s "$LASTERR" ] && json_add_string error "$(cat "$LASTERR")"
+		state_json
+		unlock
+		json_dump
+		return
+	fi
+	echo "$now" > "$LASTTRY"
+	if do_fetch; then
+		json_add_boolean ok 1
+		[ "$CHANGED" = 1 ] && json_add_boolean changed 1 || json_add_boolean changed 0
+	else
+		# disabled 不是网络故障，不记进 LASTERR（下面的清理流程会把状态文件一并清掉）
+		[ "$ERR" = disabled ] || echo "$ERR" > "$LASTERR"
+		json_add_boolean ok 0
+		json_add_string error "$ERR"
+		# 拉不到配置：服务器忙是服务器在限速，不是菜单该撤的理由；其余情况立即撤掉菜单
+		if [ "$ERR" = disabled ]; then
+			# 拉取途中开关被关掉：缓存交给关闭流程清理，这里不能再写“关闭”缓存把菜单状态弄乱
+			purge_cache && json_add_boolean changed 1 || json_add_boolean changed 0
+		elif [ "$ERR" != busy ]; then
+			# 菜单已撤：同时清掉“上次成功”时间，网络恢复后 cron/boot 才会很快补查，
+			# 不必等将近 24 小时（服务器其实开着的话菜单就能自己回来）
+			rm -f "$LASTOK"
+			if write_disabled; then json_add_boolean changed 1; else json_add_boolean changed 0; fi
+		else
+			json_add_boolean changed 0
+		fi
+	fi
+	state_json
+	unlock
+	json_dump
+}
+
+cmd_cron() {
+	gate || exit 0
+	[ "$(cut -d. -f1 /proc/uptime)" -ge 120 ] || exit 0
+	synced || exit 0
+	auto_due || exit 0
+	lock || exit 0
+	# 等锁期间别的实例可能已经拉过了：拿到锁后重查到期和最小间隔
+	if auto_due && gap_ok; then
+		date +%s > "$LASTTRY"
+		fetch_logged
+	fi
+	unlock
+}
+
+cmd_boot() {
+	local tries=0 p
+	gate || exit 0
+	mkdir -p "$D"
+	if ! mkdir "$BOOTLOCK" 2>/dev/null; then
+		p=$(cat "$BOOTLOCK/pid" 2>/dev/null)
+		# pid 还是空：对方刚建锁没来得及写，等一下再看；仍为空才算遗留的陈旧锁
+		[ -n "$p" ] || { sleep 2; p=$(cat "$BOOTLOCK/pid" 2>/dev/null); }
+		if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then exit 0; fi
+		rm -rf "$BOOTLOCK"
+		mkdir "$BOOTLOCK" 2>/dev/null || exit 0
+	fi
+	echo $$ > "$BOOTLOCK/pid"
+	trap '[ "$(cat "$BOOTLOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$BOOTLOCK"' EXIT
+	while [ "$tries" -lt 12 ]; do
+		[ -s "$LASTOK" ] && exit 0
+		sleep 20
+		gate || exit 0        # 等待期间被关掉就退出
+		if synced && lock; then
+			# 等锁期间别人已经拉成功了就收工；离上次尝试不满 MIN_GAP 秒这轮先不联网
+			if [ -s "$LASTOK" ]; then unlock; exit 0; fi
+			if gap_ok; then
+				date +%s > "$LASTTRY"
+				if fetch_logged; then unlock; exit 0; fi
+			fi
+			unlock
+		fi
+		tries=$((tries + 1))
+		sleep 40
+	done
+}
+
+cmd_probe() { # <https://host[:port]>  只检查能不能连上并通过证书校验
+	local s=$1 code rc now last
+	json_init
+	valid_server "$s" || {
+		json_add_boolean ok 0; json_add_string error bad_server; json_dump; return; }
+	mkdir -p "$D"
+	now=$(date +%s)
+	last=$(cat "$PROBETRY" 2>/dev/null || echo 0)
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	if [ "$now" -ge "$last" ] && [ $((now - last)) -lt 5 ]; then
+		json_add_boolean ok 0; json_add_string error busy; json_dump; return
+	fi
+	echo "$now" > "$PROBETRY"
+	[ -f "$CA" ] || { json_add_boolean ok 0; json_add_string error no_ca; json_dump; return; }
+	code=$(curl -sS --cacert "$CA" -m 8 -o /dev/null -w '%{http_code}' "$s/api/v1/fun" 2>/dev/null)
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		json_add_boolean ok 0
+		case "$rc" in
+			28) json_add_string error timeout ;;
+			35|51|58|59|60|77|83|90|91) json_add_string error tls ;;
+			*) json_add_string error nonet ;;
+		esac
+	elif [ "$code" = 200 ] || [ "$code" = 429 ]; then
+		json_add_boolean ok 1
+	else
+		json_add_boolean ok 0; json_add_string error "http_$code"
+	fi
+	json_dump
+}
+
+cmd_reset() {
+	# 抢不到锁说明另一个实例正在拉取：不去动它的缓存，直接报忙
+	lock || { echo "busy" >&2; exit 1; }
+	rm -f "$CUR" "$LASTOK" "$LASTTRY" "$LASTERR" "$D/new.json" "$D/fetch.tmp"
+	flush_menu
+	unlock
+}
+
+cmd_sync() {
+	local prev
+	mkdir -p "$D"
+	prev=$(cat "$FUNSTATE" 2>/dev/null)
+	if ! fun_on; then
+		# 关：清缓存和菜单索引（本来就没有缓存就什么都不动），并记下开关现在是关的
+		echo 0 > "$FUNSTATE"
+		purge_cache
+		return 0
+	fi
+	echo 1 > "$FUNSTATE"
+	# 开关本来就是开的：这次提交改的是别的选项，不联网。
+	# 重启后 /tmp 是空的，prev 为空按“关”算：第一次提交至多问一次（下面还有成功缓存/最小间隔两道闸）
+	[ "$prev" = 1 ] && return 0
+	[ -s "$LASTOK" ] && return 0
+	lock || return 0
+	# 拿到锁之后再确认一遍：等锁的这几秒里别人可能已经拉成功了，或刚刚才试过
+	if [ -s "$LASTOK" ] || ! gap_ok; then unlock; return 0; fi
+	# 还没对时：不记 LASTTRY(没真的联网)，直接交给 boot 等对时
+	synced || { unlock; return 2; }
+	date +%s > "$LASTTRY"
+	if fetch_logged; then unlock; return 0; fi
+	unlock
+	# 没成功且开关还开着：返回 2 让调用方接着起 boot 重试
+	fun_on && return 2
+	return 0
+}
+
+case "$1" in
+	manual) cmd_manual ;;
+	cron)   cmd_cron ;;
+	boot)   cmd_boot ;;
+	state)  cmd_state ;;
+	probe)  cmd_probe "$2" ;;
+	reset)  cmd_reset ;;
+	sync)   cmd_sync ;;
+	*) echo "usage: $0 manual|cron|boot|state|probe <url>|reset|sync" >&2; exit 1 ;;
+esac

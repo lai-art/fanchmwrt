@@ -1,0 +1,122 @@
+<%+header%>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OPENWRT WEBUI</title>
+  <script>
+    // Defined in <head> so it exists before the iframe's load event can fire
+    // (the old inline onload raced the bottom-of-body <script> and threw
+    // "showHalfPage is not defined").
+    function showHalfPage() {
+      var m = document.getElementById('loadingMessage');
+      if (m) m.style.display = 'none';
+      var f = document.getElementById('embeddedPage');
+      if (f) f.style.transform = 'translateY(0)';
+    }
+  </script>
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+    }
+
+    #loadingMessage {
+      margin-bottom: 20px;
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: white;
+      z-index: 10;
+    }
+
+    #embeddedPageContainer {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    #embeddedPage {
+      width: 100%;
+      height: 100%;
+      border: none;
+      transform: translateY(-570px);
+    }
+
+    /* s54 嵌入页铺满整个右侧内容区(原来的"MT5700M-CN巴龙Web管理"标题也去掉了)。
+       argon 的 .container 自带上左右 18.75px、底部 15px 外边距，#maincontent 底部还留了 33.75px；
+       类名只在本页由下面的脚本加上，别的页面不受影响。
+       .container 改成纵向 flex，iframe 吃掉全部高度。原来 iframe 是 height:100% 又排在标题下面，
+       手机上会把外层顶出 20 多像素的滚动条。
+       aurora 皮肤桌面端用 .main-right:not(#mwrt-nope) > #maincontent 加 !important 设了底部内边距，
+       这里同样用 :not(#…) 叠出两个 id 的优先级才压得住。 */
+    .main-right:not(#mw-n) > #maincontent.mw-embed-full { padding: 0 !important; }
+    /* s133 手机端 aurora(chrome.css 768px 断点)给 #maincontent 设了 flex:none!important，
+       整块缩成 iframe 默认的 150px 高、挤在顶部；嵌入页单独撑回去(桌面本来就是 flex:1)。 */
+    .main-right:not(#mw-n) > #maincontent.mw-embed-full { flex: 1 1 auto !important; min-height: 0 !important; }
+    .main-right:not(#mw-n) > #maincontent.mw-embed-full > .container.mw-embed-full {
+      display: flex !important;
+      flex-direction: column !important;
+      max-width: none !important;
+      width: auto !important;
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+    .main-right:not(#mw-n) > #maincontent.mw-embed-full > .container.mw-embed-full > #embeddedPageContainer { flex: 1 1 auto; height: auto; min-height: 0; }
+    /* s146 手机端：iframe 做成圆角卡片，上沿和顶栏留 6px 缝，下沿正好落在悬浮底栏上方 6px。
+       iframe 自己也带圆角，Safari 只靠外层 overflow 裁不住 iframe 的角。 */
+    @media (max-width: 768px) {
+      .main-right:not(#mw-n) > #maincontent.mw-embed-full > .container.mw-embed-full > #embeddedPageContainer {
+        margin-top: 6px; border-radius: 16px; isolation: isolate; background: #f3f6fb;
+        box-shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 4px 16px rgba(16, 24, 40, .07);
+      }
+      #embeddedPage { border-radius: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <!-- 2026-10-11 前端换成 H5000M 固件里的 V2.2.2。后端同时从 python
+       websocket_server.py(8766) 换成 C 写的 webuiserver(8765),ws 地址由
+       /www/5700/config.json 下发,见 gen_webui_config.sh。 -->
+  <div id="loadingMessage">正在加载API...</div>
+  <div id="embeddedPageContainer">
+    <iframe id="embeddedPage" src=""></iframe>
+  </div>
+  <script>
+    (function () {
+      // The 5700 SPA lives at /www/5700 and is served SAME-ORIGIN by the main
+      // uhttpd (docroot /www, ports 80/443). Embedding it with a relative,
+      // scheme-and-host-less path makes the iframe follow whatever protocol and
+      // IP the browser used for LuCI itself -- so it adapts to any br-lan IP
+      // change AND avoids mixed content (an absolute http://host:8888 URL turned
+      // a same-origin embed into a cross-origin, cross-scheme one, which HTTPS
+      // blocks). Route is /overview (s40 总览页) for this bundle (hash 路由, 已核实
+      // historyType 回退值就是 "hash")。
+      var f = document.getElementById('embeddedPage');
+      // s54 贴边样式只作用于本页，见上面 <style> 里的 mw-embed-full
+      var box = document.getElementById('embeddedPageContainer').parentElement, mc = document.getElementById('maincontent');
+      box && box.classList.add('mw-embed-full');
+      mc && mc.classList.add('mw-embed-full');
+      // Attach the load handler before setting src so it can't be missed
+      // (fixes the old "showHalfPage is not defined" onload race).
+      f.addEventListener('load', showHalfPage);
+      // ?v= 是 bundle 指纹(relpath+内容的 md5 前 8 位,由 tools/fp.py 算)。
+      // 2026-10-11 换成 H5000M 的新前端(V2.2.2)时,index.html 的文件名没变,
+      // rom 里所有文件 mtime 又钉死在同一个值,浏览器会拿着缓存里的旧壳去加载
+      // 已经不存在的 umi.0620da34.js,页面直接白。带上指纹,bundle 一变 URL
+      // 就变。换 bundle 时这个值必须跟着改,见 luci-cache-version-stamp。
+      // s104: 首页「锁频设置」磁贴带 #/network/setting 跳进来。只放行小写字母和斜杠组成的短路径
+      // (umi 的 hash 路由),其余一律回退总览页,避免把任意字符串塞进 iframe 地址。
+      var route = /^#(\/[a-z]{2,12}){1,2}$/.test(location.hash) ? location.hash : '#/overview';
+      // s146: c= 是 mwrt-skin.css 的指纹。皮肤一改 index.html 里的引用就变，壳本身也得换 URL 才不吃旧缓存。
+      f.src = '/5700/?v=467955a7&c=1db9c9a9' + route;
+    })();
+  </script>
+</body>
+<%+footer%>

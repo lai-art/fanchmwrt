@@ -1,0 +1,17 @@
+#!/bin/sh
+# 首次启动：把 Mwrt 的全局脚本块 / Aurora 皮肤注入到 luci-base 模板（幂等）
+# 说明：这些注入脚本本身幂等（重复执行不会重复插入），luci-base 升级会把模板
+# 覆盖回去，所以保留脚本在 /usr/bin 下，需要时可手动再跑一次。
+
+[ -x /usr/bin/install-mwrt-global.sh ] && /usr/bin/install-mwrt-global.sh >/dev/null 2>&1
+[ -x /usr/bin/install-aurora-skin.sh ] && /usr/bin/install-aurora-skin.sh >/dev/null 2>&1
+[ -x /usr/bin/install-wizard.sh ] && /usr/bin/install-wizard.sh >/dev/null 2>&1
+
+uci -q get luci.main.mediaurlbase >/dev/null 2>&1 || \
+	uci -q set luci.main.mediaurlbase='/luci-static/argon'
+uci -q commit luci 2>/dev/null
+
+rm -f /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+
+exit 0

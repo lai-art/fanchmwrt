@@ -1,0 +1,9 @@
+#!/bin/sh
+# 趣玩中心：外网口起来后，后台等对时再向更新服务器拉一次菜单配置。
+# 本机内部网口(lan/回环)起来不算联网；已经拉成功过(/tmp/mwrt-fun/last.ok)的脚本自己会退出，
+# 同时只会有一个等待进程（见 /usr/libexec/mwrt-fun boot）。
+[ "$ACTION" = ifup ] || exit 0
+case "$INTERFACE" in loopback|lan|lan[0-9]*) exit 0 ;; esac
+[ -x /usr/libexec/mwrt-fun ] || exit 0
+/usr/libexec/mwrt-fun boot >/dev/null 2>&1 &
+exit 0

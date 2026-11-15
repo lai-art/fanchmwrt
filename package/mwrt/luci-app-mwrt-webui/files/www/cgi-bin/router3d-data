@@ -1,0 +1,467 @@
+#!/bin/sh
+# =============================================================================
+# router3d-data  ——  免鉴权只读状态端点 (放 /www/cgi-bin/, 需 chmod +x)
+# 只读 /proc /sys uci ubus,绝不调 sendat/AT(热路径,避免 tom_modem 进程泄漏)。
+# 输出: Content-type application/json + 空行 + JSON。
+# =============================================================================
+printf 'Content-type: application/json\r\n'
+printf 'Cache-Control: no-store\r\n'
+printf '\r\n'
+
+# --- helpers ---------------------------------------------------------------
+rd() { cat "$1" 2>/dev/null; }                 # safe read (empty on error)
+# s176 rdv 变量 文件: 内建 read 取第一行, 不 fork。这些 sysfs 小文件都是单行, 原先每个都 $(cat) 一次, 一轮几十个进程
+rdv() { local _l=""; { read -r _l < "$2"; } 2>/dev/null; eval "$1=\$_l"; }
+# s176 无反斜杠/引号(绝大多数字段)就直接输出, 不再每个字段 fork 一次 sed
+json_str() { case "$1" in *[\\\"]*) printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' ;; *) printf '%s' "$1" ;; esac; }
+# s176 jsv 变量名: 原地做 JSON 转义。$(json_str ..) 在 ash 里连函数也要 fork 子 shell, 这个只有值里真有引号/反斜杠时才 fork 一次 sed
+jsv() { eval "_v=\$$1"; case "$_v" in *[\\\"]*) _v=$(printf '%s' "$_v" | sed 's/\\/\\\\/g; s/"/\\"/g'); eval "$1=\$_v" ;; esac; }
+is_num() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+
+# --- model -----------------------------------------------------------------
+# board_name 对 MAX/Ultra 是同一份 DTS(实测为 "NRadio-C2000MAX-Ultra",同时含
+# MAX 与 Ultra 字样),无法据此区分。改用【物理核心数】判定:MAX=双核(mt7987B),
+# Ultra=四核(mt7987A)。核心数是真实硬件反馈,不受共用机型名影响。
+rdv BOARD /tmp/sysinfo/board_name
+[ -n "$BOARD" ] || rdv BOARD /proc/device-tree/model
+NCPU=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+is_num "$NCPU" || NCPU=1
+[ "$NCPU" -gt 0 ] 2>/dev/null || NCPU=1
+# E87N 先按机型串识别(model="EdgePi E87N" / board_name="edgepi,e87n"),它也是四核,
+# 不先拦下会被下面"≥4核=Ultra"误判成 Ultra。前端 IMG 表据此选 e87n.png。
+MODEL_ID=$(printf '%s %s' "$BOARD" "$(rd /tmp/sysinfo/model)" | tr 'A-Z' 'a-z')
+case "$MODEL_ID" in
+  *h5000m*) MODEL="H5000M" ;;
+  *n3000*) MODEL="N3000" ;;   # s197 NRadio N3000(MT7981 + 1G + 2.5G, 无模组), 须先拦下免得判成 MAX
+  *c5800*) MODEL="C5800" ;;   # s197 NRadio C5800(同 C8 的四个 DSA 口 + POE/AK68; 有正面/背面两张图), 须排在 C8 之前
+  *c8-668*|*c8-688*|*c8-5800*) MODEL="C8" ;;   # s175 NRadio C8 系列(三口交换机+2.5G 口共 4 个 LAN, 另有模组 2.5G PHY), 须先拦下免得判成 MAX
+  *tr3000*) MODEL="TR3000" ;;   # s165 Cudy TR3000(双核无模组口),须先拦下免得判成 MAX
+  *n5000*) MODEL="N5000" ;;   # 与 Ultra 同款四核主板,须先拦下
+  *e87n*|*edgepi*) MODEL="E87N" ;;
+  *ap3000m*) MODEL="AP3000M" ;;   # s188 Airpi AP3000M(MT7981 双核 CPE), 须先拦下免得判成 MAX
+  *wh3000*) MODEL="WH3000" ;;     # s188 Huasifei WH3000 eMMC(MT7981 双核 CPE)
+  *q30*) MODEL="Q30PRO" ;;        # s188 JCG Q30 PRO(MT7981 双核路由器, 无 USB/模组)
+  *) if [ "$NCPU" -ge 4 ]; then MODEL="Ultra"; else MODEL="MAX"; fi ;;
+esac
+UPTIME=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+is_num "$UPTIME" || UPTIME=0
+
+# --- firmware --------------------------------------------------------------
+FW=$(sed -n "s/^DISTRIB_DESCRIPTION='\(.*\)'/\1/p" /etc/openwrt_release 2>/dev/null)
+[ -n "$FW" ] || rdv FW /etc/openwrt_version
+[ -n "$FW" ] || FW="OpenWrt"
+FW="${FW%% by *}"        # 去掉 "... by Padavanonly's ..." 冗长后缀,保留版本号
+
+# --- cpu (load + cores) ----------------------------------------------------
+# NCPU 已在上面 model 区块算过(用于机型判定),此处复用。
+read LOAD1 _rest < /proc/loadavg 2>/dev/null
+[ -n "$LOAD1" ] || LOAD1=0
+# s176 首页 CPU 以【真实占用率】为准(和系统概览页同口径), load1 只留作浮窗附注:
+# 双核小设备上 load1 把等 IO 的任务也算进去, 空闲时也常年 1 上下, 用户会误以为 CPU 很高。
+# 快照 /tmp/.r3d-cpu = "总 空闲"; 距上次采样的节拍数不够(多页同时轮询)就沿用上次算出的值, 不覆盖快照。
+CPUPCT="null"
+# s176 devinfo 每轮把「系统概览」同口径(top -n1)的结果写在 /tmp/mwrt_cpu_top, 有就直接用, 首页各处与概览/圆环同一个数
+_tp=""; [ -r /tmp/mwrt_cpu_top ] && read -r _tp < /tmp/mwrt_cpu_top
+case "$_tp" in ''|*[!0-9]*) _tp="" ;; esac
+read -r _c cu cn cs ci cio cirq csirq cst _r < /proc/stat 2>/dev/null
+if [ -n "$ci" ]; then
+    CT=$((cu + cn + cs + ci + cio + cirq + csirq + cst)); CI=$((ci + cio))
+    PT=""; PI=""
+    [ -r /tmp/.r3d-cpu ] && read -r PT PI < /tmp/.r3d-cpu
+    case "$PT$PI" in ''|*[!0-9]*) PT="" ;; esac
+    if [ -n "$PT" ] && [ "$CT" -ge "$PT" ]; then
+        DT=$((CT - PT))
+        if [ "$DT" -ge $((50 * NCPU)) ]; then
+     CPUPCT=$(( (DT - (CI - PI)) * 100 / DT ))
+     [ "$CPUPCT" -lt 0 ] && CPUPCT=0
+     [ "$CPUPCT" -gt 100 ] && CPUPCT=100
+     echo "$CT $CI" > /tmp/.r3d-cpu
+            echo "$CPUPCT" > /tmp/.r3d-cpupct
+        else
+            read -r CPUPCT < /tmp/.r3d-cpupct 2>/dev/null
+     case "$CPUPCT" in ''|*[!0-9]*) CPUPCT="null" ;; esac
+        fi
+    else
+        echo "$CT $CI" > /tmp/.r3d-cpu
+    fi
+fi
+[ -n "$_tp" ] && CPUPCT=$_tp
+# 自算值(无 devinfo 值时兜底)同样过观感曲线: <=40 按 1/4, 之上 10+(p-40)*1.5
+if [ -z "$_tp" ] && [ "$CPUPCT" != "null" ]; then
+    if [ "$CPUPCT" -le 40 ]; then CPUPCT=$((CPUPCT / 4)); else CPUPCT=$((10 + (CPUPCT - 40) * 3 / 2)); fi
+    [ "$CPUPCT" -gt 100 ] && CPUPCT=100
+fi
+
+# --- memory (KB) -----------------------------------------------------------
+MEM_T=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+MEM_A=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+is_num "$MEM_T" || MEM_T=0
+is_num "$MEM_A" || MEM_A=0
+
+# --- temperature (max thermal zone, °C) ------------------------------------
+TEMP="null"; TMAX=-1
+for z in /sys/class/thermal/thermal_zone*/temp; do
+    [ -e "$z" ] || continue
+    rdv v "$z"; is_num "$v" || continue
+    [ "$v" -gt "$TMAX" ] && TMAX="$v"
+done
+[ "$TMAX" -ge 0 ] 2>/dev/null && TEMP=$(( (TMAX + 500) / 1000 ))
+
+# --- storage (overlay, KB) -------------------------------------------------
+SLINE=$(df -k /overlay 2>/dev/null | awk 'NR==2{print $2" "$3}')
+[ -n "$SLINE" ] || SLINE=$(df -k / 2>/dev/null | awk 'NR==2{print $2" "$3}')
+ST_T=$(echo "$SLINE" | cut -d' ' -f1); ST_U=$(echo "$SLINE" | cut -d' ' -f2)
+is_num "$ST_T" || ST_T=0
+is_num "$ST_U" || ST_U=0
+
+# --- online clients (全站统一口径, 由 /usr/libexec/mwrt-clients 计算) ---------
+# 无线=本机所有 AP 口关联在册的站点; 有线=桥转发表里的有线口新鲜条目 + ARP 完成态 + 网关走本机,
+# 同 MAC 有线无线只算一次(以无线为准)。该脚本自带 <=3 秒内存盘缓存, 首页每 1.8 秒轮询不会重复算。
+# 脚本缺失/出错时退回旧口径(LAN 桥上 ARP 完成态按 MAC 去重)。
+LANDEV=$(uci -q get network.lan.device); [ -n "$LANDEV" ] || LANDEV=br-lan
+CLIENTS=""
+if [ -x /usr/libexec/mwrt-clients ]; then
+    CLIENTS=$(/usr/libexec/mwrt-clients 2>/dev/null | sed -n 's/.*"counts":{[^}]*"total":\([0-9][0-9]*\)}.*/\1/p' | head -n 1)
+fi
+if ! is_num "$CLIENTS"; then
+    CLIENTS=$(awk -v d="$LANDEV" '$6==d && $3=="0x2" && $4!="00:00:00:00:00:00"{print $4}' /proc/net/arp 2>/dev/null | sort -u | grep -c .)
+fi
+is_num "$CLIENTS" || CLIENTS=0
+
+# --- wan ip (effective default-route source addr, no AT) -------------------
+WANIP=$(ip -4 route get 8.8.8.8 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)
+[ -n "$WANIP" ] || WANIP=""
+# 子网前缀位数(/24 这种)。首页卡片把它做成一枚小徽章挂在 IP 末尾(内容美化,不另发请求)。
+# WANIP 是实际出口的源地址,从各接口的 inet 行里反查它的 /NN;取不到就留 0,前端不显示徽章。
+WANPFX=0
+if [ -n "$WANIP" ]; then
+    WANPFX=$(ip -4 addr show 2>/dev/null | sed -n "s#.*inet $WANIP/\([0-9][0-9]*\).*#\1#p" | head -1)
+    is_num "$WANPFX" || WANPFX=0
+fi
+
+# --- unique premium fields (与下方蜂窝模组区块不重复) -----------------------
+KERNEL=$(uname -r 2>/dev/null)
+LANIP=$(uci -q get network.lan.ipaddr)
+[ -n "$LANIP" ] || LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+# LAN 前缀: 先看 netmask(uci 配置里就是点分形式),换算成位数;netmask 空就从 br-lan 的 inet /NN 取
+LANPFX=0
+LANMASK=$(uci -q get network.lan.netmask)
+if [ -n "$LANMASK" ]; then
+    oIFS=$IFS; IFS=.; set -- $LANMASK; IFS=$oIFS
+    for o in "$@"; do
+        case "$o" in
+            255) LANPFX=$((LANPFX+8)) ;;
+            254) LANPFX=$((LANPFX+7)) ;; 252) LANPFX=$((LANPFX+6)) ;;
+            248) LANPFX=$((LANPFX+5)) ;; 240) LANPFX=$((LANPFX+4)) ;;
+            224) LANPFX=$((LANPFX+3)) ;; 192) LANPFX=$((LANPFX+2)) ;;
+            128) LANPFX=$((LANPFX+1)) ;;
+        esac
+    done
+fi
+if [ "$LANPFX" = "0" ] && [ -n "$LANIP" ]; then
+    LANPFX=$(ip -4 addr show br-lan 2>/dev/null | sed -n "s#.*inet $LANIP/\([0-9][0-9]*\).*#\1#p" | head -1)
+    is_num "$LANPFX" || LANPFX=0
+fi
+rdv CONNS /proc/sys/net/netfilter/nf_conntrack_count; is_num "$CONNS" || CONNS=0
+
+# --- ports (eth carrier/speed) --------------------------------------------
+WANDEV=$(uci -q get network.wan.device)
+[ -n "$WANDEV" ] || WANDEV=eth0
+WANOFF=$(uci -q get network.wan.disabled)   # s178 旧版全 LAN 时只标 disabled
+port_json=""
+# s175 C8 系列: 四个 LAN 口是交换机的 DSA 口 lan1..lan4(不在 eth* 里), 排在最前面; eth1(模组 2.5G PHY)照旧在后面当 WAN
+if [ "$MODEL" = "C8" ] || [ "$MODEL" = "C5800" ]; then
+    for n in 1 2 3 4; do
+        dev=/sys/class/net/lan$n
+        [ -e "$dev" ] || continue
+        name=lan$n
+        rdv car "$dev/carrier"; [ "$car" = "1" ] || car=0
+        rdv spd "$dev/speed"; is_num "$spd" || spd=-1
+        [ "$car" = "1" ] || spd=-1
+        rdv up "$dev/operstate"; [ "$up" = "up" ] && upv=1 || upv=0
+        rdv cnt "$dev/carrier_up_count"; is_num "$cnt" || cnt=0
+        rdv prx "$dev/statistics/rx_bytes"; is_num "$prx" || prx=0
+        rdv ptx "$dev/statistics/tx_bytes"; is_num "$ptx" || ptx=0
+        dup=""; [ "$car" = "1" ] && rdv dup "$dev/duplex"
+        rdv mac "$dev/address"
+        [ -n "$port_json" ] && port_json="$port_json,"
+        jsv dup
+        jsv mac
+        if [ "$name" = "$WANDEV" ] && [ "$WANOFF" != 1 ]; then role=WAN; else role=LAN; fi
+        port_json="$port_json{\"id\":\"$name\",\"role\":\"$role\",\"carrier\":$car,\"speed\":$spd,\"up\":$upv,\"cnt\":$cnt,\"rx\":$prx,\"tx\":$ptx,\"dup\":\"$dup\",\"mac\":\"$mac\"}"
+    done
+fi
+for dev in /sys/class/net/eth*; do
+    [ -e "$dev" ] || continue
+    name=$(basename "$dev")
+    # 只保留【物理真实存在】的网口:
+    #   1) 设备树 GMAC(uevent 含 OF_NAME=mac),排除 modem/内部虚拟口
+    #      (如 eth2 = 2_1 数据口,MAC 伪造、carrier 恒 1);
+    #   2) 且必须绑定了 PHY(存在 phydev 符号链接)。C2000MAX 只有一个物理网口,
+    #      源码 02_network 为方便同时声明了 eth0/eth1,但 MAX 上未接 PHY 的那个 MAC
+    #      (eth0)无 phydev、operstate 恒 down —— 据此过滤掉,面板只反映真实网口。
+    #      Ultra 两个物理口都绑 PHY,均保留。
+    grep -q 'OF_NAME=mac' "$dev/uevent" 2>/dev/null || continue
+    [ -e "$dev/phydev" ] || continue
+    rdv car "$dev/carrier"; [ "$car" = "1" ] || car=0
+    rdv cnt "$dev/carrier_up_count"; is_num "$cnt" || cnt=0
+    # s190c MT7981 内置千兆 PHY 的驱动(patches-6.6/9999-01-hnat.patch: mtk_gphy_cl22_read_status)
+    #   在"自协商未完成且没检测到对端"时强制 link=1/1000M/Full(用意是让 GMAC 常通, HNAT/USB 转发不因口上没线而断),
+    #   所以这类口没插线内核 carrier 也恒为 1, 且插拔都不会翻转 carrier / carrier_up_count。
+    #   面板要反映真实插线: 对端通告模式(ethtool 的 Link partner advertised link modes)只有真有对端才有值。
+    #   真实状态翻转自己记账: /tmp/.r3d-rl-<口> = "<上次状态> <上线次数>", 翻到有线时 cnt+1(前端据此放接入动画)。
+    case "$(readlink "$dev/phydev/driver" 2>/dev/null)" in
+    *"MT7981 PHY"*)
+        if [ "$car" = "1" ] && [ -x /usr/sbin/ethtool ]; then
+            ethtool "$name" 2>/dev/null | grep -q 'Link partner advertised link modes:[[:space:]]*[0-9]' || car=0
+            rl_s=0; rl_c=0
+            [ -r "/tmp/.r3d-rl-$name" ] && read rl_s rl_c < "/tmp/.r3d-rl-$name"
+            is_num "$rl_c" || rl_c=0
+            if [ "$rl_s" != "$car" ] || [ ! -e "/tmp/.r3d-rl-$name" ]; then
+                [ "$car" = "1" ] && rl_c=$((rl_c+1))
+                echo "$car $rl_c" > "/tmp/.r3d-rl-$name"
+            fi
+            cnt=$rl_c
+        fi
+        ;;
+    esac
+    rdv spd "$dev/speed"; is_num "$spd" || spd=-1
+    [ "$car" = "1" ] || spd=-1
+    rdv up "$dev/operstate"; [ "$up" = "up" ] && upv=1 || upv=0
+    [ "$car" = "1" ] || upv=0
+    if [ "$name" = "$WANDEV" ]; then role="WAN"; else role="LAN"; fi
+    # s74 悬停浮层用: 本口累计收发、双工、MAC(都是 sysfs 单文件)
+    rdv prx "$dev/statistics/rx_bytes"; is_num "$prx" || prx=0
+    rdv ptx "$dev/statistics/tx_bytes"; is_num "$ptx" || ptx=0
+    dup=""; [ "$car" = "1" ] && rdv dup "$dev/duplex"
+    rdv mac "$dev/address"
+    [ -n "$port_json" ] && port_json="$port_json,"
+    jsv dup
+    jsv mac
+    port_json="$port_json{\"id\":\"$name\",\"role\":\"$role\",\"carrier\":$car,\"speed\":$spd,\"up\":$upv,\"cnt\":$cnt,\"rx\":$prx,\"tx\":$ptx,\"dup\":\"$dup\",\"mac\":\"$mac\"}"
+done
+
+# --- usb (外接 USB 设备, 只读 sysfs) ----------------------------------------
+# 判型交给 /usr/libexec/mwrt-usbinfo(全局接入通知用的同一份), 一台一行 "|" 分隔。
+usb_json=""; HASMOD=0
+if [ -x /usr/libexec/mwrt-usbinfo ]; then
+    while IFS='|' read -r ub uv up us ut um usub user umfr uname; do
+        [ -n "$ub" ] || continue
+        is_num "$us" || us=0; is_num "$um" || um=0; is_num "$usub" || usub=0
+        [ "$ut" = "modem" ] && HASMOD=1
+        # s88: USB 网卡 / 手机共享(nic、tether)多给 dev(网口名)和 role(pending|lan|wan|tether);
+        # role 来自 mwrt-usbnic 的记录(/tmp/mwrt-usbnic.d/<口名>), 没记录(开关关着)就是空串。name 空时用厂商名补
+        usb_x=""
+        if [ "$ut" = "nic" ] || [ "$ut" = "tether" ]; then
+            udev=""; urole=""
+            for nd in /sys/bus/usb/devices/"$ub":*/net/* /sys/bus/usb/devices/"$ub".*:*/net/*; do
+                [ -e "$nd" ] && { udev=${nd##*/}; break; }
+            done
+            [ -n "$udev" ] && urole=$(sed -n 's/^role=//p' "/tmp/mwrt-usbnic.d/$udev" 2>/dev/null | head -n 1)
+            [ -n "$uname" ] || uname=$umfr
+            jsv udev
+            jsv urole
+            usb_x=",\"dev\":\"$udev\",\"role\":\"$urole\""
+        fi
+        # s89: USB 声卡(audio)多给 card(ALSA 声卡号, 来自 <总线位置>:*/sound/card<N>, 读不到给 -1)。
+        # 前端不得依赖 card, 播放/音量一律以 audio_state 为准。
+        if [ "$ut" = "audio" ]; then
+            ucard=-1
+            for sd in "${MWRT_SYS:-/sys}"/bus/usb/devices/"$ub":*/sound/card*; do
+                [ -e "$sd" ] || continue
+                cn=${sd##*/card}
+                case "$cn" in ''|*[!0-9]*) continue ;; esac
+                ucard=$cn; break
+            done
+            usb_x=",\"card\":$ucard"
+        fi
+        [ -n "$usb_json" ] && usb_json="$usb_json,"
+        jsv ub
+        jsv uv
+        jsv up
+        jsv ut
+        jsv umfr
+        jsv uname
+        usb_json="$usb_json{\"bus\":\"$ub\",\"vid\":\"$uv\",\"pid\":\"$up\",\"speed\":$us,\"type\":\"$ut\",\"mb\":$um,\"sub\":$usub,\"mfr\":\"$umfr\",\"name\":\"$uname\"$usb_x}"
+    done <<USBEOF
+$(/usr/libexec/mwrt-usbinfo 2>/dev/null)
+USBEOF
+fi
+
+# --- wan traffic (累计收发字节,单次读取) -----------------------------------
+# 计数取【实际出口】,不取 network.wan.device: 后者是物理 WAN 口(eth0),
+# 走 5G 模组上网时它没插线、计数恒 0,真正出流量的是模组数据口(eth2 = 2_1)。
+# 出口和上面 WANIP 用同一条 route get,两格永远对应同一个接口;
+# 没有默认路由时回落到物理 WAN 口。
+TRDEV=$(ip -4 route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+# s74 当前上网方式(产品图左上角徽章): 按实际出口网卡归类, 没有默认路由就是 none。
+#   apcli*/wlan* = WiFi 桥接; 物理 WAN 口 / pppoe-* / 其他物理 GMAC 口 = 有线;
+#   其余(模组数据口 eth2、usb0、wwan0 等) = 蜂窝
+EGDEV=$TRDEV; EGKIND=none
+CELLDEV=$(uci -q get network.cell.device 2>/dev/null)   # s180 出厂蜂窝口 cell(只有 C8 系列有)
+# s88: 出口是 USB 网卡 / 手机共享口(mwrt-usbnic 的记录里有它)时: 手机共享=tether, USB 网卡=有线
+EGUSB=""
+[ -n "$EGDEV" ] && EGUSB=$(sed -n 's/^kind=//p' "/tmp/mwrt-usbnic.d/$EGDEV" 2>/dev/null | head -n 1)
+if [ -n "$EGDEV" ]; then
+    case "$EGUSB:$EGDEV" in
+        tether:*) EGKIND=tether ;;
+        nic:*) EGKIND=wired ;;
+        *)
+    case "$EGDEV" in
+        apcli*|wlan*) EGKIND=wifi ;;
+        "$CELLDEV") EGKIND=cell ;;   # s180 C8 内部 2.5G PHY(eth1)接模组 = 蜂窝口, 虽带 OF_NAME=mac 也算蜂窝
+        pppoe-*|lan[0-9]*|"$WANDEV") EGKIND=wired ;;   # s178 lanN = 交换机 DSA 口当 WAN
+        *) if grep -q 'OF_NAME=mac' "/sys/class/net/$EGDEV/uevent" 2>/dev/null; then EGKIND=wired; else EGKIND=cell; fi ;;
+    esac
+        ;;
+    esac
+fi
+EGW=$(ip -4 route get 8.8.8.8 2>/dev/null | sed -n 's/.* via \([0-9.]*\).*/\1/p' | head -1)
+# 物理 WAN 口自己的协议和地址(不管它是不是当前出口; pppoe 时地址在 pppoe-wan 上)
+WANPROTO=$(uci -q get network.wan.proto)
+WANL3=$WANDEV; [ "$WANPROTO" = "pppoe" ] && WANL3=pppoe-wan
+WANADDR=$(ip -4 addr show dev "$WANL3" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\/[0-9]*\).*/\1/p' | head -1)
+[ -n "$TRDEV" ] && [ -e "/sys/class/net/$TRDEV/statistics" ] || TRDEV=$WANDEV
+rdv WRX "/sys/class/net/$TRDEV/statistics/rx_bytes"; is_num "$WRX" || WRX=0
+rdv WTX "/sys/class/net/$TRDEV/statistics/tx_bytes"; is_num "$WTX" || WTX=0
+
+# --- wifi 世代 / 无线桥接 (uci 只读, 结果缓存 5 秒, 首页每 1.8 秒轮询不必每次 fork) -------
+# wifi:{gen:BE|AX|"",ssid,bands:[{b:2g|5g|6g,gen,ssid,on}]}  wlb:{bridged,associated,ssid}
+WCACHE=/tmp/.r3d-wifi
+NOW=$(date +%s 2>/dev/null); is_num "$NOW" || NOW=0
+WC_T=""; WIFI_JSON=""; WLB_JSON=""
+if [ -r "$WCACHE" ]; then
+    { read -r WC_T; read -r WIFI_JSON; read -r WLB_JSON; } < "$WCACHE" 2>/dev/null
+fi
+if ! is_num "$WC_T" || [ -z "$WLB_JSON" ] || [ "$NOW" -eq 0 ] || [ "$NOW" -lt "$WC_T" ] || [ $((NOW - WC_T)) -ge 5 ]; then
+    WOUT=$(uci -q show wireless 2>/dev/null | awk '
+    function esc(s,   i, c, o) { o = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); if (c == "\\" || c == "\"") o = o "\\"; o = o c } return o }
+    function val(l,   v, q) { q = sprintf("%c", 39); v = l; sub(/^[^=]*=/, "", v); sub("^" q, "", v); sub(q "$", "", v); gsub(q "\\\\" q q, q, v); return v }
+    {
+        split($0, kv, "="); n = split(kv[1], pp, ".")
+        if (n == 2) { sec = pp[2]; typ = val($0); if (typ == "wifi-device") dev[sec] = 1; else if (typ == "wifi-iface") { ifc[sec] = 1; ord[++ni] = sec } }
+        else if (n == 3) {
+            sec = pp[2]; opt = pp[3]; v = val($0)
+            if (opt == "htmode") ht[sec] = v
+            else if (opt == "band") bd[sec] = v
+            else if (opt == "channel") ch[sec] = v
+            else if (opt == "phy") phy[sec] = v
+            else if (opt == "disabled") dis[sec] = v
+            else if (opt == "mode") md[sec] = v
+            else if (opt == "ssid") ss[sec] = v
+            else if (opt == "device") dv[sec] = v
+        }
+    }
+    END {
+        gen = ""
+        for (d in dev) {
+            if (dis[d] == "1") continue
+            if (ht[d] ~ /^EHT/) gen = "BE"; else if (ht[d] ~ /^HE/ && gen != "BE") gen = "AX"
+        }
+        apss = ""; stass = ""; stphy = ""; sta = 0
+        for (i in ifc) {
+            if (md[i] == "ap" && apss == "") apss = ss[i]
+            if (md[i] == "sta" && !sta) { sta = 1; stass = ss[i]; stphy = phy[dv[i]] }
+        }
+        # 按频段汇总(顺序固定 2g,5g,6g): band 缺失按 channel 推断, 推断不了就跳过该 device
+        for (d in dev) {
+            if (dis[d] == "1") continue
+            b = tolower(bd[d])
+            if (b ~ /^2/) b = "2g"; else if (b ~ /^5/) b = "5g"; else if (b ~ /^6/) b = "6g"
+            else { b = ""; if (ch[d] ~ /^[0-9]+$/ && ch[d] + 0 >= 1) b = (ch[d] + 0 <= 14) ? "2g" : "5g" }
+            if (b == "") continue
+            devb[d] = b; bp[b] = 1
+            g = ""
+            if (ht[d] ~ /^EHT/) g = "BE"; else if (ht[d] ~ /^HE/) g = "AX"
+            if (g == "BE" || (g == "AX" && bg[b] != "BE")) bg[b] = g
+        }
+        for (k = 1; k <= ni; k++) {
+            i = ord[k]; b = devb[dv[i]]
+            if (b == "" || md[i] != "ap" || dis[i] == "1" || bon[b]) continue
+            bon[b] = 1; bs[b] = ss[i]
+        }
+        bj = ""; nb = split("2g 5g 6g", bn, " ")
+        for (k = 1; k <= nb; k++) {
+            b = bn[k]; if (!bp[b]) continue
+            if (bj != "") bj = bj ","
+            bj = bj "{\"b\":\"" b "\",\"gen\":\"" bg[b] "\",\"ssid\":\"" esc(bs[b]) "\",\"on\":" (bon[b] ? 1 : 0) "}"
+        }
+        print gen; print apss; print sta; print stass; print stphy; print "[" bj "]"
+    }')
+    WGEN=""; WSSID=""; HASSTA=0; SSSID=""; SPHY=""; WBANDS=""
+    {
+        IFS= read -r WGEN; IFS= read -r WSSID; IFS= read -r HASSTA; IFS= read -r SSSID; IFS= read -r SPHY; IFS= read -r WBANDS
+    } <<WEOF
+$WOUT
+WEOF
+    WASSOC=0
+    if [ "$HASSTA" = "1" ]; then
+        # ra0 → apcli0 ; rai0 → apclii0(与 modem.lua 的 wlb_radio 同口径)
+        SNET=apcli0; [ "$SPHY" = "rai0" ] && SNET=apclii0
+        AP=$(iwconfig "$SNET" 2>/dev/null | sed -n 's/.*Access Point: *\([0-9A-Fa-f:]*\).*/\1/p' | head -1)
+        case "$AP" in ''|00:00:00:00:00:00) ;; *) WASSOC=1 ;; esac
+    else
+        HASSTA=0
+    fi
+    case "$WBANDS" in \[*\]) ;; *) WBANDS="[]" ;; esac
+    jsv WSSID
+    WIFI_JSON="{\"gen\":\"$WGEN\",\"ssid\":\"$WSSID\",\"bands\":$WBANDS}"
+    jsv SSSID
+    WLB_JSON="{\"bridged\":$HASSTA,\"associated\":$WASSOC,\"ssid\":\"$SSSID\"}"
+    printf '%s\n%s\n%s\n' "$NOW" "$WIFI_JSON" "$WLB_JSON" > "$WCACHE" 2>/dev/null
+fi
+
+# --- modem (no AT!) --------------------------------------------------------
+rdv MODCONF /tmp/modconf.conf
+rdv SIMSEL /tmp/sim_sel; [ -n "$SIMSEL" ] || SIMSEL=$(uci -q get mwrt.@ndis[0].simsel)
+[ -n "$SIMSEL" ] || SIMSEL="0"
+present=0
+[ -n "$MODCONF" ] && present=1
+# N5000 的 modconf 在拔掉转接板后仍会残留,改以 USB 上真有 modem 类设备为准;其他机型保持原逻辑
+[ "$MODEL" = "N5000" ] && present=$HASMOD
+[ "$MODEL" = "TR3000" ] && present=$HASMOD
+CSQ="null"
+for cf in /tmp/modem_csq /tmp/run/modem_csq; do
+    rdv v "$cf"; if is_num "$v"; then CSQ="$v"; fi
+done
+
+# --- s91 音乐播放器状态(产品图左上角"正在播放"标识用) ---------------------------
+# 只读 mwrt-audio 守护进程自己落的 /tmp/mwrt-audio/state.json: 守护进程在才算数(pid 存活),
+# 播放中/已暂停给 {"s":..,"t":<曲名, 已是 JSON 转义串>}, 其余给 null。不唤起守护进程、不碰 ALSA。
+APLAY="null"
+AUF=/tmp/mwrt-audio/state.json
+if [ -r "$AUF" ] && [ -r /tmp/mwrt-audio/daemon.pid ]; then
+    apid=$(head -n 1 /tmp/mwrt-audio/daemon.pid 2>/dev/null)
+    if is_num "$apid" && [ -d "/proc/$apid" ]; then
+        ast=$(sed -n 's/.*"player":{[^}]*"state":"\([a-z]*\)".*/\1/p' "$AUF" | head -n 1)
+        case "$ast" in
+            playing|paused)
+                # 键按字母序落盘(..state,title,track), 曲名夹在 "title":" 与 ","track" 之间; busybox sed 不吃带 * 的 \| 交替
+                att=$(sed -n 's/.*"title":"\(.*\)","track".*/\1/p' "$AUF" | head -n 1)
+                APLAY="{\"s\":\"$ast\",\"t\":\"$att\"}"
+                ;;
+        esac
+    fi
+fi
+
+jsv BOARD
+jsv FW
+jsv KERNEL
+jsv WANIP
+jsv LANIP
+jsv EGDEV
+jsv WANPROTO
+jsv MODCONF
+# s197 C5800: POE 口(lan4)外接 AK68 的状态, 由 mwrt-ak68 守护写到 /tmp; 其它机型整个字段是 null
+AK68_JSON=null
+if [ "$MODEL" = "C5800" ]; then
+    AK68_JSON=$(cat /tmp/mwrt-ak68.json 2>/dev/null | tr -d '\r\n')
+    case "$AK68_JSON" in "{"*"}") ;; *) AK68_JSON='{"present":0}' ;; esac
+fi
+jsv SIMSEL
+printf '{"model":"%s","board":"%s","fw":"%s","kernel":"%s","uptime":%s,"cpu":{"load1":%s,"ncpu":%s,"pct":%s},"mem":{"total":%s,"avail":%s},"temp":%s,"storage":{"total":%s,"used":%s},"clients":%s,"conns":%s,"wan_ip":"%s","wan_pfx":%s,"lan_ip":"%s","lan_pfx":%s,"wan_rx":%s,"wan_tx":%s,"ports":[%s],"usb":[%s],"egress":{"dev":"%s","kind":"%s","gw":"%s"},"wan_proto":"%s","wan_addr":"%s","modem":{"present":%s,"modconf":"%s","sim_sel":"%s","csq":%s},"wifi":%s,"wlb":%s,"aplay":%s,"ak68":%s}\n' \
+    "$MODEL" "$BOARD" "$FW" "$KERNEL" "$UPTIME" \
+    "$LOAD1" "$NCPU" "$CPUPCT" "$MEM_T" "$MEM_A" "$TEMP" "$ST_T" "$ST_U" "$CLIENTS" "$CONNS" \
+    "$WANIP" "$WANPFX" "$LANIP" "$LANPFX" "$WRX" "$WTX" "$port_json" "$usb_json" \
+    "$EGDEV" "$EGKIND" "$EGW" "$WANPROTO" "$WANADDR" \
+    "$present" "$MODCONF" "$SIMSEL" "$CSQ" "$WIFI_JSON" "$WLB_JSON" "$APLAY" "$AK68_JSON"
