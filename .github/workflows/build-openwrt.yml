@@ -292,6 +292,24 @@ jobs:
             log "  OK: 无开源 mt76 相关包"
           fi
           log ""
+          log "=== 全锥 NAT：必须用 nft 实现，禁止 2018 版 xt_FULLCONENAT ==="
+          # run#38 实测：kmod-ipt-fullconenat 的 xt_FULLCONENAT.c 在 6.12 上有 4 处
+          # 源码级 API 不兼容（.fcn / register 返回值 / unregister 参数 / prandom_u32），
+          # 且要等 3.5 小时编到该包才暴露。这里在 defconfig 之后立刻拦住被依赖反选的情况。
+          if grep -qx "CONFIG_PACKAGE_kmod-ipt-fullconenat=y" .config; then
+            log "  FAIL kmod-ipt-fullconenat 被重新选中（6.12 上编不过）"
+            grep -E "^CONFIG_PACKAGE_kmod-ipt-fullconenat=" .config | tee -a "$OUT"
+            fail=1
+          else
+            log "  OK: kmod-ipt-fullconenat 未选中"
+          fi
+          if grep -qx "CONFIG_PACKAGE_kmod-nft-fullcone=y" .config; then
+            log "  OK: kmod-nft-fullcone 已选中"
+          else
+            log "  FAIL kmod-nft-fullcone 缺失（全锥 NAT 功能会没有）"
+            fail=1
+          fi
+          log ""
           log "=== 配置中请求但被 defconfig 丢弃的包 ==="
           # 2026-11-14: 改为"记录不阻断"。原因: 用户按 Mwrt 原包清单一次性提交了 500+ 包,
           # 其中不可避免存在 25.12 已更名的包名。若仍按老逻辑直接 fail, 每轮只能拿到
