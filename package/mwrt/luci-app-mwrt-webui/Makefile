@@ -12,7 +12,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-mwrt-webui
 PKG_VERSION:=5.1.1162
-PKG_RELEASE:=24
+PKG_RELEASE:=25
 
 PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE
@@ -27,7 +27,9 @@ define Package/luci-app-mwrt-webui
   TITLE:=Mwrt full web UI (home page, modem pages, tools)
   DEPENDS:=+luci-base +luci-compat +luci-lua-runtime \
            +luci-theme-argon +luci-theme-aurora \
-           +kmod-usb-core +kmod-usb-serial +kmod-usb-serial-option +usb-modeswitch +usbutils
+           +kmod-usb-core +kmod-usb-serial +kmod-usb-serial-option +usb-modeswitch +usbutils \
+           +libblkid
+  # +libblkid: usr/bin/ated 链接 libblkid.so.1（run#41 失败根因）
   PKGARCH:=all
 endef
 
@@ -54,11 +56,12 @@ endef
 define Package/luci-app-mwrt-webui/install
 	$(INSTALL_DIR) $(1)/
 	$(CP) ./files/. $(1)/
-	# 可执行位（cp 已保留，这里兜底）
-	$(CHMOD) 0755 $(1)/usr/bin/mwrt-* 2>/dev/null || true
-	$(CHMOD) 0755 $(1)/usr/libexec/rpcd/* 2>/dev/null || true
-	$(CHMOD) 0755 $(1)/www/cgi-bin/* 2>/dev/null || true
-	$(CHMOD) 0755 $(1)/etc/init.d/* 2>/dev/null || true
+	# 可执行位（cp 已保留，这里兜底）。注意用 chmod 而非 $(CHMOD)：
+	# CHMOD 不是标准变量，展开为空会导致裸 0755 命令（run#41 日志实证）
+	chmod 0755 $(1)/usr/bin/mwrt-* 2>/dev/null || true
+	chmod 0755 $(1)/usr/libexec/rpcd/* 2>/dev/null || true
+	chmod 0755 $(1)/www/cgi-bin/* 2>/dev/null || true
+	chmod 0755 $(1)/etc/init.d/* 2>/dev/null || true
 endef
 
 define Package/luci-app-mwrt-webui/conffiles
