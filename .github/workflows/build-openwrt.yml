@@ -219,7 +219,6 @@ jobs:
             CONFIG_PACKAGE_luci-theme-argon \
             CONFIG_PACKAGE_luci-theme-aurora \
             CONFIG_PACKAGE_luci-app-mwrt-catcage \
-            CONFIG_PACKAGE_luci-app-Airpifanctrl \
             CONFIG_PACKAGE_luci-app-openclash ; do
             if grep -qx "${c}=y" .config; then
               log "  OK   $c"
@@ -290,6 +289,15 @@ jobs:
             fail=1
           else
             log "  OK: 无开源 mt76 相关包"
+          fi
+
+          log "=== 风扇栈已移除确认 (TR3000 无风扇硬件, 2026-11-19 起移除) ==="
+          if grep -qE "^CONFIG_PACKAGE_(kmod-Airpi-gpio-fan|luci-app-Airpifanctrl|kmod-hwmon-pwmfan|kmod-hwmon-core)=y" .config; then
+            grep -E "^CONFIG_PACKAGE_(kmod-Airpi-gpio-fan|luci-app-Airpifanctrl|kmod-hwmon-pwmfan|kmod-hwmon-core)=y" .config | tee -a "$OUT"
+            log "  FAIL 风扇栈被重新选中 (应是 is not set)"
+            fail=1
+          else
+            log "  OK: Airpi/pwm-fan/hwmon 均未选中"
           fi
           log ""
           log "=== 全锥 NAT：必须用 nft 实现，禁止 2018 版 xt_FULLCONENAT ==="
