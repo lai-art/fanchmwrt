@@ -292,12 +292,22 @@ jobs:
           fi
 
           log "=== 风扇栈已移除确认 (TR3000 无风扇硬件, 2026-11-19 起移除) ==="
-          if grep -qE "^CONFIG_PACKAGE_(kmod-Airpi-gpio-fan|luci-app-Airpifanctrl|kmod-hwmon-pwmfan|kmod-hwmon-core)=y" .config; then
-            grep -E "^CONFIG_PACKAGE_(kmod-Airpi-gpio-fan|luci-app-Airpifanctrl|kmod-hwmon-pwmfan|kmod-hwmon-core)=y" .config | tee -a "$OUT"
+          if grep -qE "^CONFIG_PACKAGE_(kmod-Airpi-gpio-fan|luci-app-Airpifanctrl|kmod-hwmon-pwmfan)=y" .config; then
+            grep -E "^CONFIG_PACKAGE_(kmod-Airpi-gpio-fan|luci-app-Airpifanctrl|kmod-hwmon-pwmfan)=y" .config | tee -a "$OUT"
             log "  FAIL 风扇栈被重新选中 (应是 is not set)"
             fail=1
           else
-            log "  OK: Airpi/pwm-fan/hwmon 均未选中"
+            log "  OK: Airpi 驱动 / Airpifanctrl / pwm-fan 均未选中"
+          fi
+          # kmod-hwmon-core 只是 hwmon 框架本身(约 30KB), run#45 实测 defconfig 会把它拉回来:
+          # 说明树内还有别的包依赖它。先不阻断构建, 只把 Kconfig 里的选择关系打出来定位。
+          if grep -qx "CONFIG_PACKAGE_kmod-hwmon-core=y" .config; then
+            log "  WARN kmod-hwmon-core 被其它包依赖并重新选中(不阻断), 依赖关系见下:"
+            log "--- tmp/.config-package.in 中 hwmon-core 的上下文 ---"
+            grep -B6 -A6 "config PACKAGE_kmod-hwmon-core" tmp/.config-package.in | tee -a "$OUT"
+            log "--- .config 里 select 它的符号(反查无直接映射, 以上下文为准) ---"
+          else
+            log "  OK: kmod-hwmon-core 未选中"
           fi
           log ""
           log "=== 全锥 NAT：必须用 nft 实现，禁止 2018 版 xt_FULLCONENAT ==="
