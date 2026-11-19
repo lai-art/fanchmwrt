@@ -1,0 +1,7 @@
+=== 编完的包 (有 time: .../compile 统计行的) 共 0 个 ===
+
+=== 关键包在日志中的出现次数 (0 = 本轮完全没被编译) ===
+0  package/mtk/drivers/conninfra
+0  package/mtk/drivers/warp
+0  package/mtk/drivers/mt_wifi
+0  package/mtk/applications
