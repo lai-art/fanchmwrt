@@ -70,7 +70,7 @@ jq
 jshn
 jsonfilter
 kernel
-kmod-Airpi-gpio-fan
+# kmod-Airpi-gpio-fan  2026-11-19 移除(TR3000 无风扇硬件)
 kmod-asn1-decoder
 kmod-ata-core
 kmod-bonding
@@ -128,8 +128,8 @@ kmod-fs-smbfs-common
 kmod-fs-vfat
 kmod-fwx
 kmod-gpio-button-hotplug
-kmod-hwmon-core
-kmod-hwmon-pwmfan
+# kmod-hwmon-core    2026-11-19 移除(仅被 Airpi/pwm-fan 引用)
+# kmod-hwmon-pwmfan  2026-11-19 移除(TR3000 无 pwm-fan 节点)
 kmod-ifb
 kmod-inet-diag
 kmod-input-core
@@ -378,7 +378,7 @@ logd
 lua
 lua-cjson
 luci
-luci-app-Airpifanctrl
+# luci-app-Airpifanctrl  2026-11-19 移除(配套 Airpi 驱动一并删除)
 luci-app-WTModem
 luci-app-cpe
 luci-app-ddns
